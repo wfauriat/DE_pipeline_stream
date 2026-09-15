@@ -66,9 +66,9 @@ spark = [
 testpaths = ["source/tests", "ingest/tests"]
 # importlib mode: both members can have tests/test_*.py with the same file
 # names without clashing. Shared test helpers are therefore plain modules with
-# unique names (e.g. source/tests/simkit.py), put on the path here.
+# unique names (source/tests/simkit.py, ingest/tests/bridgekit.py), put on the path here.
 addopts = "--import-mode=importlib"
-pythonpath = ["source/tests"]
+pythonpath = ["source/tests", "ingest/tests"]
 filterwarnings = [
     # Third-party deprecations raised inside starlette's TestClient, not in our code.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
@@ -82,7 +82,7 @@ target-version = "py312"
 [tool.ruff.lint.isort]
 # Import blocks: stdlib / third-party / our packages / test helpers.
 known-first-party = ["bikeshare_sim", "bikeshare_bridge"]
-known-local-folder = ["simkit"]
+known-local-folder = ["simkit", "bridgekit"]
 
 # For editors (Pyright / Pylance): analyse with the project's .venv, where the
 # workspace members are installed as editable packages.

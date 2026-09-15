@@ -23,15 +23,22 @@ unexport VIRTUAL_ENV
 -include .env
 export
 
+# By default BuildKit attaches a timestamped provenance attestation to every
+# image. The image ID then changes on every build, even when every layer comes
+# from cache, and `make up` would needlessly restart the containers.
+# (Run `docker compose up --build` by hand and you will see those restarts.)
+export BUILDX_NO_DEFAULT_ATTESTATIONS := 1
+
 UV       ?= uv
 COMPOSE  ?= docker compose
 API      := http://localhost:$(or $(SOURCE_API_PORT),8000)
 CURL     := curl -fsS
 JSON     := -H 'content-type: application/json'
 
-.PHONY: help setup dirs test lint fmt up down ps logs \
+.PHONY: help setup dirs test lint fmt up down ps logs reset \
         source-run source-reset clock speed pause resume ff stream stats \
-        faults fault fault-rate fault-on fault-off fault-log
+        faults fault fault-rate fault-on fault-off fault-log \
+        topics tail dlq bridge-run bridge-reset
 
 help: ## list targets
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -69,17 +76,24 @@ up: .env dirs ## build and start the stack in the background
 down: ## stop the stack (data/ is kept)
 	$(COMPOSE) down
 
-ps: ## list containers and their health
-	$(COMPOSE) ps
+ps: ## list containers and their health (one-shot ones too: kafka-init)
+	$(COMPOSE) ps -a
 
 logs: ## follow logs: make logs [s=source-api]
 	$(COMPOSE) logs -f --tail=100 $(s)
+
+# The pieces of state must stay consistent with each other: the bridge's
+# checkpoint is a seq of the source's stream, and Kafka holds what was sent
+# up to it. So reset them together.
+reset: ## stop everything and wipe ALL state: source world, bridge checkpoint, Kafka topics
+	$(COMPOSE) down -v
+	rm -f data/source/state.* data/bridge/checkpoint.*
 
 ##@ Source: the synthetic bike-share API  (docs: http://localhost:8000/docs)
 source-run: .env dirs ## run the source on the host instead of Docker (Ctrl-C stops it)
 	SOURCE_PORT=$(or $(SOURCE_API_PORT),8000) $(UV) run python -m bikeshare_sim
 
-source-reset: ## stop the source and wipe its state: a fresh world on next start
+source-reset: ## stop the source and wipe its state (a fresh world; see also `make reset`)
 	-$(COMPOSE) rm -sf source-api
 	rm -f data/source/state.pkl data/source/state.pkl.bak data/source/state.tmp
 
@@ -130,3 +144,31 @@ fault-off: ## disable a fault: make fault-off f=duplicate
 fault-log: ## the last 20 injected faults (ground truth)
 	@$(CURL) "$(API)/admin/fault-log?limit=10000" \
 	  | jq -c '.[-20:][] | {fault_id, fault_type, injected_at, event_id, details}'
+
+##@ Kafka and the bridge  (Console UI: http://localhost:8081)
+# The Kafka CLI tools ship inside the broker image. Run them there, against the INTERNAL listener.
+KAFKA_BIN := $(COMPOSE) exec -T kafka /opt/kafka/bin
+
+topics: ## topics with partition count and messages written (end offsets)
+	@$(KAFKA_BIN)/kafka-get-offsets.sh --bootstrap-server kafka:9092 --exclude-internal-topics \
+	  | awk -F: '{n[$$1] += $$3; p[$$1]++} \
+	    END {for (t in n) printf "  %-30s partitions=%-2d messages=%d\n", t, p[t], n[t]}' | sort
+
+tail: ## print messages: make tail t=bikeshare.trip-events.v1 [n=5] [from=beginning]
+	@$(KAFKA_BIN)/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic $(t) \
+	  --max-messages $(or $(n),5) $(if $(from),--from-beginning) --timeout-ms 20000 \
+	  --command-property enable.auto.commit=false \
+	  --formatter-property print.partition=true --formatter-property print.key=true \
+	  --formatter-property print.headers=true 2>/dev/null || true
+
+dlq: ## the first dead letters (events the bridge rejected): make dlq [n=3]
+	@$(MAKE) -s tail t=bikeshare.dlq.v1 n=$(or $(n),3) from=beginning
+
+# The container bridge must be stopped first: both would share data/bridge/checkpoint.json.
+bridge-run: .env dirs ## run the bridge on the host (first: docker compose stop bridge)
+	SOURCE_URL=$(API) KAFKA_BOOTSTRAP=localhost:$(or $(KAFKA_HOST_PORT),9094) \
+	  BRIDGE_STATE_DIR=data/bridge $(UV) run python -m bikeshare_bridge
+
+bridge-reset: ## stop the bridge and forget its checkpoint (next start replays the source buffer)
+	-$(COMPOSE) rm -sf bridge
+	rm -f data/bridge/checkpoint.json

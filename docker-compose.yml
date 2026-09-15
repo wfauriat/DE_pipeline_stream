@@ -46,3 +46,107 @@ services:
     # Time to close SSE streams and save state.pkl on `docker compose down`.
     stop_grace_period: 20s
     restart: unless-stopped
+
+  # ── Layer 2: the event backbone and the first hop of the pipeline ───────────
+  kafka:
+    image: apache/kafka:4.3.1           # pinned; the image turns KAFKA_* variables into server.properties
+    hostname: kafka
+    environment:
+      # One node that is both broker and KRaft controller: Kafka's own
+      # metadata quorum, with no ZooKeeper. A real cluster runs 3+ controllers.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Formats the storage on first start. Generated with `kafka-storage.sh random-uuid`.
+      CLUSTER_ID: MoQ1R7PRSkaSfyAV5NC-sg
+
+      # Listeners: LISTENERS is where Kafka accepts connections; ADVERTISED is
+      # the address it tells clients to use afterwards. A client connects to its
+      # bootstrap address, gets the advertised address back, and reconnects there.
+      #   INTERNAL  kafka:9092      for containers (bridge, Spark, Airflow, Console)
+      #   EXTERNAL  localhost:9094  for tools on your machine (make bridge-run, notebooks)
+      # One advertised address cannot satisfy both: "kafka" does not resolve on
+      # your host, and "localhost" inside a container is the container itself.
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Single node: Kafka's internal topics cannot have 3 replicas on 1 broker.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics exist only if kafka/create-topics.sh declares them (see kafka-init).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data  # "logs" = the partition data files, not text logs
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m   # enough for this volume, and kind to your RAM
+    volumes:
+      - kafka-data:/var/lib/kafka/data     # named volume: survives `down`, wiped by `make reset`
+    ports:
+      - "${KAFKA_HOST_PORT:-9094}:9094"    # only the EXTERNAL listener is published
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 15s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  kafka-init:
+    # One-shot: creates the topics, then exits. `docker compose ps -a` shows
+    # "Exited (0)" when it worked. The bridge waits for that.
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - ./kafka:/opt/de-modern/kafka:ro
+    entrypoint: ["/bin/bash", "/opt/de-modern/kafka/create-topics.sh"]
+    restart: "no"
+
+  bridge:
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    image: de-modern/bridge:dev
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # Read by bikeshare_bridge/config.py. The two addresses use service names
+      # and CONTAINER ports: http://source-api:8000, not localhost:${SOURCE_API_PORT}.
+      SOURCE_URL: http://source-api:8000
+      KAFKA_BOOTSTRAP: kafka:9092          # the INTERNAL listener
+      BRIDGE_STATE_DIR: data/bridge
+      BRIDGE_START_FROM: oldest            # first start: replay the source's buffer
+      LOG_LEVEL: info
+    volumes:
+      - ./data/bridge:/app/data/bridge     # checkpoint.json: last seq safely in Kafka
+    depends_on:
+      source-api:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 15s                 # time to flush Kafka and save the checkpoint
+    restart: unless-stopped
+
+  console:
+    # Redpanda Console: a web UI for Kafka (topics, messages, consumer groups and lag).
+    # It speaks the Kafka protocol, so it works with Apache Kafka.
+    image: redpandadata/console:v3.11.0
+    environment:
+      KAFKA_BROKERS: kafka:9092
+    ports:
+      - "${CONSOLE_PORT:-8081}:8080"       # → http://localhost:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  kafka-data:

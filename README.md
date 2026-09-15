@@ -38,3 +38,31 @@ make down                           # stop the stack (data/ is kept)
 The source can also run on the host with `make source-run`, using the same
 config and the same state file. Don't run it at the same time as the container:
 both use port 8000.
+
+## Layer 2: Kafka and the bridge
+
+`make up` now also starts Kafka (a single KRaft node), `kafka-init` (a one-shot
+that creates the topics), the bridge (source SSE → Kafka) and Redpanda Console.
+
+```
+source-api ──SSE──► bridge ──► bikeshare.trip-events.v1     (key: bike_id)
+                      │    ──► bikeshare.station-status.v1  (key: station_id)
+                      └──────► bikeshare.dlq.v1             (contract violations, with the reason)
+```
+
+```bash
+make ps                                   # 5 services; kafka-init shows "Exited (0)"
+make topics                               # messages per topic
+make tail t=bikeshare.trip-events.v1      # next 5 messages: partition, headers, key, value
+make fault f=schema_drift && make dlq     # watch a contract violation land in the DLQ
+make logs s=bridge                        # JSON logs; a "throughput" line every 30 s
+open http://localhost:8081                # Redpanda Console: browse topics and messages
+make reset                                # wipe ALL state (world, checkpoint, topics) together
+```
+
+Kafka answers on two addresses. Containers use `kafka:9092`; tools on your
+machine use `localhost:9094` (e.g. `make bridge-run`). The kafka service in
+`docker-compose.yml` explains why.
+
+If your `.env` predates layer 2, the new variables (`KAFKA_HOST_PORT`,
+`CONSOLE_PORT`) fall back to their defaults. Compare it with `.env.example`.
