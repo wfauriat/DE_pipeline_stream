@@ -136,7 +136,7 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **Machine:** 20 cores, 15 GiB RAM (~11 GiB available), ~15 GB free disk.
 - **Host UID:GID** is 1001:1001, used for container bind mounts.
 - Kafka, Spark, Airflow, dbt and duckdb are not installed on the host. They come from Docker images or the uv venv.
-- **Unrelated containers already running:** `media27-postgres` (host port 5432) and `phoenix` (4317, 6006). Our stack must not publish 5432: Airflow's metadata Postgres stays internal. Ports 8000, 8080, 8081, 4040, 9092 and 9094 were free.
+- The planned host ports (8000, 8080, 8081, 4040, 9092, 9094) were free. Airflow's metadata Postgres will not publish a host port.
 
 ## Known issues / TODO
 
