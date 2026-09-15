@@ -1,0 +1,28 @@
+# Runtime data written by the running stack (bind-mounted into containers):
+# DuckDB files, Parquet lake, Spark checkpoints, simulator/bridge state.
+data/
+
+# Local environment
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# dbt artifacts (regenerated on every run)
+transform/target/
+transform/logs/
+transform/dbt_packages/
+
+# Airflow task logs, if written to the host
+orchestration/logs/
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
