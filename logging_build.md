@@ -11,8 +11,8 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 0 | Records: git init, `PLAN.md`, `logging_build.md` | ✅ done | 2026-09-15 | `4cae360` |
 | 1a | Environment: uv workspace, `.env.example`, Makefile skeleton | ✅ done | 2026-09-15 | `9c0606a` |
 | 1b | Source: sim clock, world, engine, faults, FastAPI and SSE, tests, Dockerfile, compose | ✅ done | 2026-09-15 | `efee5aa` |
-| 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ⏸ waiting for your review | 2026-09-15 | "Layer 2" commit |
-| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ⬜ todo | | |
+| 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ✅ done | 2026-09-15 | `04dede1` |
+| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ⏸ waiting for your review | 2026-09-16 | "Layer 3" commit |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ⬜ todo | | |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⬜ todo | | |
 | 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⬜ todo | | |
@@ -144,6 +144,62 @@ Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 - **Host bridge** via `localhost:9094` (EXTERNAL listener): works and hands the checkpoint back to the container.
 - **DLQ vs ground truth:** 64 events the fault log says break the contract (schema_drift, plus negative impossible_status) = the 64 dead-lettered event_ids. 0 missed, 0 unexpected.
 
+### Layer 3: Spark analyzer (2026-09-15 → 16)
+
+**Read first, in this order:**
+
+1. `streaming/analyzer/main.py`: the four queries and why there are four.
+2. `rules.py`: the detection logic, as pure DataFrame functions.
+3. `streaming/conf/spark-defaults.conf`: local mode, shuffle partitions, RocksDB state store.
+4. `streaming/Dockerfile` and `entrypoint.sh`: connector at build time, arbitrary UID.
+
+| File | Purpose |
+|---|---|
+| `streaming/stream_analyzer.py` | The spark-submit entry file. It imports `analyzer.main`. |
+| `streaming/analyzer/config.py` | Env settings: Kafka, source URL, lake and checkpoint dirs, trigger, watermark (30 min), windows (30 min metrics, 120 min health), status interval, max trip duration (3 h), late threshold (25 min), starting offsets, maxOffsetsPerTrigger. |
+| `…/schemas.py` | The event schema (envelope plus a flat payload superset), the station schema, the alert columns. |
+| `…/rules.py` | `parse_events`, `over_capacity`, `teleports` (haversine), `late_events`, `station_windows`, `window_alerts`, `trip_pairs` (full outer join), `orphan_alerts`, `make_alerts` (deterministic `alert_id`), `to_kafka_records` (`ignoreNullFields=false`). |
+| `…/reference.py` | `/v1/stations` fetched with urllib and refreshed every 60 s. It is used inside `foreachBatch`, because capacities change. |
+| `…/progress.py` | `StreamingQueryListener`: one JSON line per non-empty batch (input rows, rate, watermark, state rows, rows dropped late, duplicates dropped). |
+| `…/main.py` | Four queries: `reference_rules` (foreachBatch + persist → Kafka), `station_metrics` (parquet file sink, `partitionBy(date)`), `station_health` (2 h windows → Kafka), `trip_pairing` (join → Kafka). Each has its own checkpoint and a 10 s trigger. |
+| `streaming/Dockerfile` | `spark:4.2.0-scala2.13-java21-python3-ubuntu` (Docker Official Image, Python 3.10). Resolves `spark-sql-kafka-0-10_2.13:4.2.0` with Ivy at build time and copies only the 4 connector jars. Spark ships the other transitive jars at identical versions (verified). |
+| `streaming/entrypoint.sh` | nss_wrapper passwd entry for the host UID, under `tini`. |
+| `streaming/conf/spark-defaults.conf`, `log4j2.properties` | Mounted read-only and commented. |
+| `streaming/ruff.toml` | Lints this folder for Python 3.10. |
+| `streaming/tests/` | 7 rule tests on a local SparkSession: real JSON through `parse_events`, one test per rule, the orphan time bound, deterministic ids. |
+| `scripts/peek_alerts.py` | Host Kafka consumer (`localhost:9094`, `assign()`, no commits): counts by type and by distinct alert_id. |
+| `scripts/peek_lake.py` | DuckDB reads `data/lake/station_metrics/**/*.parquet` in place. |
+| `docker-compose.yml` | Service `spark`, profile `stream`, runs as host UID, mounts conf plus `data/lake` and `data/checkpoints`, Spark UI on :4040. |
+| `Makefile` | Adds `alerts`, `lake` and `spark-reset` (wipes checkpoints, lake and the alerts topic). `COMPOSE_PROFILES ?= stream`. `down` and `reset` use `--profile '*'`, and `reset` also wipes checkpoints and the lake. |
+
+**How to poke at it:**
+
+- `make alerts`
+- `make lake`
+- `make logs s=spark | grep progress`
+- http://localhost:4040
+- `make fault f=teleport`, then about 20 s later `make alerts`
+
+**Verified:**
+
+- **Crash loop at first start**, caused by Hadoop login for a UID with no passwd entry. `HADOOP_USER_NAME` is not enough. Fixed with nss_wrapper.
+- **Catch-up:** the backlog of ~100k events came in 20k-row batches. The four queries then settled at a few hundred rows per 10 s batch.
+- **Restart resumes from the checkpoints:** batch ids continue from 50.
+- **`spark-reset` replay:** rebuilds the lake and the alerts from Kafka's retention.
+- **Resources:** Spark ~1.6 GB; the whole stack ~2.2 GB.
+- **Scorecard vs ground truth** (ad-hoc script, final rules, after injecting 8 frozen and 4 silent episodes):
+
+  | alert type | precision | recall |
+  |---|---|---|
+  | over_capacity | 100% | 100% |
+  | teleport | 100% | 98% |
+  | late_event (incl. stall backlog) | 100% | 100% |
+  | orphan_trip | 66% | 100% |
+  | frozen_station | 86% | 40% |
+  | silent_station | 100% | 100% |
+
+  - **Orphan false positives:** 16 had their partner dead-lettered (schema drift). 16 could not be checked (the partner had left the source buffer).
+
 ## Decisions and deviations from the plan
 
 | Date | Decision | Why |
@@ -164,6 +220,15 @@ Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 | 2026-09-15 | The bridge detects a reset source (checkpoint ahead of the source's `last_seq`) and restarts from its oldest event. | Otherwise it would silently wait for seq numbers that belong to a previous world. `make reset` wipes all state together. |
 | 2026-09-15 | `BUILDX_NO_DEFAULT_ATTESTATIONS=1` is exported by the Makefile. `provenance: false` in compose did not help (tested). | Default provenance attestations change the image ID on every build, so `make up` restarted the source and bridge every time. |
 | 2026-09-15 | librdkafka logs are routed into Python logging (`"logger"` in the producer config). | Keeps the bridge's output 100% JSON lines. |
+| 2026-09-15 | The Spark job lives in `streaming/analyzer/` (a package) plus `streaming/stream_analyzer.py`. The plan said `jobs/stream_analyzer.py` + `rules.py`. | A package gives importable, testable modules, with no generic top-level names like `rules` on the path. |
+| 2026-09-15 | Four queries: reference_rules, station_metrics, station_health, trip_pairing. | One sink per query. Stateless rules must see late events that the stateful ones drop. Each query shows one pattern. |
+| 2026-09-16 | **Frozen/silent use 2-hour "health" windows. Metrics keep 30-minute windows.** The plan said 15 min. | Measured against the ground truth: 30-min windows gave frozen 8% precision (one departure plus one arrival, or trips after the last snapshot, look frozen); 2 h windows gave 86%. Silent became `< half` of the expected reports after a first-window artifact (the world starts at 05:00, mid-window). |
+| 2026-09-15 | Spark raises `late_event` alerts itself (`emitted_at − event_time ≥ 25 min`), in the stateless query. | The plan only said "lateness / watermark drops". A direct check catches both late_event faults and stall backlogs, which the stateful queries drop past the watermark. |
+| 2026-09-15 | Alerts carry a deterministic `alert_id` (sha2 of type, entity and event or window) and explicit nulls. | The Kafka sink and foreachBatch are at-least-once: consumers dedup by id. One stable schema. |
+| 2026-09-15 | Spark runs as the host UID via `entrypoint.sh` (nss_wrapper) under `tini`. | Lake and checkpoint files stay yours. |
+| 2026-09-16 | `pyspark==4.2.0` is in the default dependency groups. The plan said opt-in. | Spark is a core component. The rules are unit-tested locally, and the version is pinned to match the image. |
+| 2026-09-15 | Spark is in compose profile `stream`. The Makefile defaults `COMPOSE_PROFILES=stream`. `down` and `reset` use `--profile '*'`. | Lets you run the core without Spark when RAM is tight. Stopping always covers every profile. |
+| 2026-09-15 | `spark-reset` also deletes the alerts topic. | Resetting a job's progress without its outputs duplicates its results on replay. |
 
 ## Pinned versions
 
@@ -178,7 +243,9 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 | duckdb | 1.5.5 (**the Airflow image must use the same version**) | `uv.lock` |
 | dbt-core / dbt-duckdb | 1.12.5 / 1.11.0 | `uv.lock` |
 | harlequin | 2.14.0 | `uv.lock` |
-| pyspark (opt-in `spark` group) | 4.2.0, so the Spark image should be 4.2.x | `uv.lock` |
+| pyspark (`spark` group, default) | 4.2.0 (= the image) | `pyproject.toml`, `uv.lock` |
+| Spark image | `spark:4.2.0-scala2.13-java21-python3-ubuntu` (Docker Official Image; JDK 21.0.12, Python 3.10.12) | `streaming/Dockerfile` |
+| Spark Kafka connector | `spark-sql-kafka-0-10_2.13:4.2.0` → kafka-clients 3.9.2, commons-pool2 2.13.1 | `streaming/Dockerfile` |
 | pytest / ruff | 9.1.1 / 0.16.7 | `uv.lock` |
 | Base image (source, bridge) | `python:3.12-slim` + `ghcr.io/astral-sh/uv:0.12.9` | `source/Dockerfile`, `ingest/Dockerfile` |
 | Kafka | `apache/kafka:4.3.1` (KRaft, JDK 21), cluster id `MoQ1R7PRSkaSfyAV5NC-sg` | `docker-compose.yml` |
@@ -201,8 +268,16 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **`make tail` joins a throwaway consumer group** (`console-consumer-…`, auto-commit off). It may show up briefly in the Console's group list.
 - **The Console's topic list includes `__consumer_offsets`**, Kafka's internal topic. `make topics` hides it.
 - **Rebuilding an image recreates its container.** Any change to the root `pyproject.toml` or `uv.lock` rebuilds both Python images, because both copy them. Code-only changes rebuild just the affected image.
-- **Next (layer 3):**
-  - a Spark 4.2.x Structured Streaming analyzer in its own container, `local[*]`, with the Kafka connector baked into the image;
-  - it reads `trip-events` and `station-status`, deduplicates by `event_id` within a watermark, and applies status rules (impossible values, flatline) and trip rules (teleport, orphans via a stream-stream join);
-  - it writes alerts to `bikeshare.alerts.v1` and 15-minute station metrics to `data/lake/` (Parquet);
-  - checkpoints go to `data/checkpoints/`.
+- **Spark: frozen_station recall is ~40%.** Episodes that are short, or at quiet stations and hours, cannot fill a 2 h window with evidence. The exact snapshot-to-snapshot check (LAG plus the trips in between) is planned in dbt (layer 5). Comparing the two is a good use of the scorecard.
+- **Spark: orphan_trip precision is ~66%** because of secondary effects (partners dead-lettered by the bridge). Layer 5's scorecard should attribute these to schema_drift rather than count them as plain false positives.
+- **Spark: `input_rows` for `trip_pairing` is 2× the Kafka rows.** Both sides of the self-join scan the source. That is inherent and harmless at this volume.
+- **Spark drops rows behind the watermark, and they are counted.** Over the final replay the progress lines added up to `dropped_late` = 10 (late events and stall backlog more than 30 simulated minutes behind) and `dropped_duplicates` = 914. Only the stateless `reference_rules` query still sees those late rows, which is why `late_event` is detected there.
+- **PySpark pitfall:** `collect()` returns naive datetimes in the Python process's local timezone (seen in the tests on this Paris-time host). The container runs in UTC.
+- **Spark's Parquet sink records its commits in `_spark_metadata/`.** DuckDB's glob ignores that log, so a crashed batch's uncommitted file could be counted. That is acceptable here.
+- **Changing `spark.sql.shuffle.partitions` or any stateful query's shape** requires `make spark-reset`. The checkpoints remember both.
+- **Next (layer 4):**
+  - Airflow 3.x (LocalExecutor, Postgres metadata DB, SimpleAuthManager) in compose profile `batch`;
+  - an image with confluent-kafka, duckdb 1.5.5 (same as the host) and pyarrow, plus dbt-duckdb in its own venv;
+  - `stream_landing` DAG: bounded Kafka → DuckDB `raw.*` batches, with offsets kept in DuckDB in the same transaction, and `raw._ingest_batches` audit rows;
+  - `api_extract` DAG: stations, bikes, weather and fault-log → `raw.*`;
+  - pool `duckdb` (1 slot), Assets, connections set from env.

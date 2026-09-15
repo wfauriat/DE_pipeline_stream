@@ -66,3 +66,42 @@ machine use `localhost:9094` (e.g. `make bridge-run`). The kafka service in
 
 If your `.env` predates layer 2, the new variables (`KAFKA_HOST_PORT`,
 `CONSOLE_PORT`) fall back to their defaults. Compare it with `.env.example`.
+
+## Layer 3: the Spark analyzer
+
+A Spark 4.2 Structured Streaming job (`streaming/`) runs four queries over
+the Kafka topics:
+
+| query | pattern | output |
+|---|---|---|
+| `reference_rules` | stateless `foreachBatch` + station data refreshed from the source API | `over_capacity`, `teleport`, `late_event` → `bikeshare.alerts.v1` |
+| `station_metrics` | watermark + dedup + 30-min windows | Parquet in `data/lake/station_metrics/` (exactly-once file sink) |
+| `station_health` | watermark + dedup + 2-hour windows | `frozen_station`, `silent_station` → alerts topic |
+| `trip_pairing` | stream-stream full outer join with a time bound | `orphan_trip` → alerts topic |
+
+```bash
+make alerts                 # alert counts by type + the latest ones (a host Kafka consumer)
+make lake                   # DuckDB reading Spark's Parquet in place, from the host
+make logs s=spark           # one JSON "progress" line per micro-batch and query
+open http://localhost:4040  # Spark UI → Structured Streaming tab
+make spark-reset && make up # replay everything from Kafka (checkpoints, lake, alerts wiped)
+COMPOSE_PROFILES= make up   # run the stack without Spark (~1.5 GB less RAM)
+```
+
+Measured against the source's ground truth (after injecting extra frozen and silent episodes):
+
+| alert type | precision | recall |
+|---|---|---|
+| over_capacity | 100% | 100% |
+| teleport | 100% | 98% |
+| late_event | 100% | 100% |
+| orphan_trip | 66% | 100% |
+| frozen_station | 86% | 40% |
+| silent_station | 100% | 100% |
+
+The orphan "false positives" are not rule bugs. The missing half of those trips
+was schema-drifted and dead-lettered by the bridge, so the pipeline really
+never saw it: one fault showing up as another.
+
+Frozen recall is limited by episodes too short, or at stations too quiet, to fill
+a 2-hour window. The exact check is sequential and comes in layer 5, with dbt.

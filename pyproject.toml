@@ -11,7 +11,8 @@
 # What lives where:
 #   source/        package `bikeshare-sim`    the synthetic upstream API (the "vendor")
 #   ingest/        package `bikeshare-bridge` SSE → Kafka bridge (first pipeline hop)
-#   streaming/     Spark job code. It runs inside the Spark image, not installed here.
+#   streaming/     Spark job code. It runs inside the Spark image, not installed here;
+#                  its tests use the local pyspark from the `spark` group.
 #   orchestration/ Airflow DAGs. They run inside the Airflow image, not installed here.
 #   transform/     dbt project. It runs with dbt-duckdb (see the `warehouse` group).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,9 +28,9 @@ dependencies = []
 # Virtual root: nothing to build or install at the top level. It only groups
 # the members and the tooling below.
 package = false
-# `uv sync` installs these groups. The heavy `spark` group is opt-in:
-#   uv sync --group spark
-default-groups = ["dev", "warehouse"]
+# `uv sync` installs these groups. `spark` is ~400 MB but a core part of the
+# stack: the Spark rules are unit-tested locally (streaming/tests).
+default-groups = ["dev", "warehouse", "spark"]
 
 [tool.uv.workspace]
 members = ["source", "ingest"]
@@ -57,18 +58,20 @@ warehouse = [
     "harlequin>=2",
 ]
 # Local pyspark to unit-test the streaming rules without the Spark container.
-# About 400 MB; needs Java 17/21 (Java 21 is installed on this host).
+# Same version as the Spark image (streaming/Dockerfile). Needs Java 17/21
+# (Java 21 is installed on this host).
 spark = [
-    "pyspark>=4.0,<5",
+    "pyspark==4.2.0",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["source/tests", "ingest/tests"]
+testpaths = ["source/tests", "ingest/tests", "streaming/tests"]
 # importlib mode: both members can have tests/test_*.py with the same file
 # names without clashing. Shared test helpers are therefore plain modules with
 # unique names (source/tests/simkit.py, ingest/tests/bridgekit.py), put on the path here.
 addopts = "--import-mode=importlib"
-pythonpath = ["source/tests", "ingest/tests"]
+# "streaming" makes the Spark job's `analyzer` package importable by its tests.
+pythonpath = ["source/tests", "ingest/tests", "streaming"]
 filterwarnings = [
     # Third-party deprecations raised inside starlette's TestClient, not in our code.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
@@ -81,7 +84,7 @@ target-version = "py312"
 
 [tool.ruff.lint.isort]
 # Import blocks: stdlib / third-party / our packages / test helpers.
-known-first-party = ["bikeshare_sim", "bikeshare_bridge"]
+known-first-party = ["bikeshare_sim", "bikeshare_bridge", "analyzer"]
 known-local-folder = ["simkit", "bridgekit"]
 
 # For editors (Pyright / Pylance): analyse with the project's .venv, where the

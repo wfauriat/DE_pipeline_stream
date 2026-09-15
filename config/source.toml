@@ -52,6 +52,8 @@ tick_ms = 200
 [emission]
 # Each station publishes a station_status snapshot every N simulated minutes.
 # 40 stations × 288 per day ≈ 11,500 status events per day.
+# The Spark analyzer needs this too, to know how many reports to expect:
+# docker-compose.yml → spark → STATUS_INTERVAL_MIN.
 status_interval_min = 5
 # Operator trucks move bikes from full stations to empty ones every N
 # simulated hours. This is silent: it only shows up in station_status.

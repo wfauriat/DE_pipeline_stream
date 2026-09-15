@@ -148,5 +148,44 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Layer 3: the real-time analyzer ─────────────────────────────────────────
+  spark:
+    # Profile "stream": started when COMPOSE_PROFILES includes it. The Makefile
+    # sets that by default; `COMPOSE_PROFILES= make up` runs without Spark (~1.5 GB less RAM).
+    profiles: ["stream"]
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile
+    image: de-modern/spark-analyzer:dev
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # Read by streaming/analyzer/config.py
+      KAFKA_BOOTSTRAP: kafka:9092              # INTERNAL listener, like the bridge
+      SOURCE_URL: http://source-api:8000       # station reference data (/v1/stations)
+      LAKE_DIR: /data/lake
+      CHECKPOINT_DIR: /data/checkpoints
+      TRIGGER_SECONDS: "10"
+      WATERMARK: 30 minutes                    # simulated time: 30 real seconds at 60×
+      STATION_WINDOW_MIN: "30"                 # metrics windows (→ lake)
+      HEALTH_WINDOW_MIN: "120"                 # frozen/silent windows (→ alerts)
+      STATUS_INTERVAL_MIN: "5"                 # = config/source.toml [emission].status_interval_min
+    volumes:
+      # Spark's own config, editable without a rebuild (restart the container).
+      - ./streaming/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./streaming/conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      # Outputs, visible on the host: the Parquet lake and each query's checkpoint
+      # (Kafka offsets, state store, commit log). Worth a look.
+      - ./data/lake:/data/lake
+      - ./data/checkpoints:/data/checkpoints
+    ports:
+      - "${SPARK_UI_PORT:-4040}:4040"          # Spark UI → Structured Streaming tab
+    depends_on:
+      source-api:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    restart: unless-stopped
+
 volumes:
   kafka-data:

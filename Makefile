@@ -23,6 +23,10 @@ unexport VIRTUAL_ENV
 -include .env
 export
 
+# Optional parts of the stack (compose profiles). Default: all of them.
+# Override in .env, or per command: `COMPOSE_PROFILES= make up` = core only.
+COMPOSE_PROFILES ?= stream
+
 # By default BuildKit attaches a timestamped provenance attestation to every
 # image. The image ID then changes on every build, even when every layer comes
 # from cache, and `make up` would needlessly restart the containers.
@@ -38,7 +42,7 @@ JSON     := -H 'content-type: application/json'
 .PHONY: help setup dirs test lint fmt up down ps logs reset \
         source-run source-reset clock speed pause resume ff stream stats \
         faults fault fault-rate fault-on fault-off fault-log \
-        topics tail dlq bridge-run bridge-reset
+        topics tail dlq bridge-run bridge-reset alerts lake spark-reset
 
 help: ## list targets
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -73,8 +77,9 @@ fmt: ## ruff autofix + format
 up: .env dirs ## build and start the stack in the background
 	$(COMPOSE) up -d --build
 
+# --profile '*': stop the services of every profile, even ones not currently selected.
 down: ## stop the stack (data/ is kept)
-	$(COMPOSE) down
+	$(COMPOSE) --profile '*' down
 
 ps: ## list containers and their health (one-shot ones too: kafka-init)
 	$(COMPOSE) ps -a
@@ -82,12 +87,14 @@ ps: ## list containers and their health (one-shot ones too: kafka-init)
 logs: ## follow logs: make logs [s=source-api]
 	$(COMPOSE) logs -f --tail=100 $(s)
 
-# The pieces of state must stay consistent with each other: the bridge's
-# checkpoint is a seq of the source's stream, and Kafka holds what was sent
-# up to it. So reset them together.
-reset: ## stop everything and wipe ALL state: source world, bridge checkpoint, Kafka topics
-	$(COMPOSE) down -v
+# The pieces of state must stay consistent with each other. The bridge's
+# checkpoint is a seq of the source's stream, Kafka holds what was sent up to
+# it, and Spark's checkpoints are offsets into those Kafka topics. So reset
+# them together.
+reset: ## stop everything and wipe ALL state: world, checkpoints, Kafka topics, lake
+	$(COMPOSE) --profile '*' down -v
 	rm -f data/source/state.* data/bridge/checkpoint.*
+	rm -rf data/checkpoints/* data/lake/*
 
 ##@ Source: the synthetic bike-share API  (docs: http://localhost:8000/docs)
 source-run: .env dirs ## run the source on the host instead of Docker (Ctrl-C stops it)
@@ -172,3 +179,18 @@ bridge-run: .env dirs ## run the bridge on the host (first: docker compose stop 
 bridge-reset: ## stop the bridge and forget its checkpoint (next start replays the source buffer)
 	-$(COMPOSE) rm -sf bridge
 	rm -f data/bridge/checkpoint.json
+
+##@ Spark analyzer  (Spark UI: http://localhost:4040)
+alerts: ## alerts raised by Spark: counts by type and the latest ones (a host Kafka consumer)
+	@$(UV) run python scripts/peek_alerts.py
+
+lake: ## Spark's Parquet output (station metrics), read in place by DuckDB from the host
+	@$(UV) run python scripts/peek_lake.py
+
+# Resetting a job means resetting its progress AND its outputs together:
+# replaying into a lake and topic that already hold the old results duplicates them.
+spark-reset: ## stop Spark, wipe its checkpoints, lake and alerts topic (replays from the earliest offsets)
+	-$(COMPOSE) rm -sf spark
+	-$(KAFKA_BIN)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic bikeshare.alerts.v1
+	rm -rf data/checkpoints/* data/lake/*
+	@echo "next: make up (kafka-init re-creates the alerts topic, Spark starts over)"
