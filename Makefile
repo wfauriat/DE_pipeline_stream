@@ -1,11 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Makefile: the single entry point for everything you run by hand.
 #
-#   make help      list every target with a one-line description
+#   make help      list every target, grouped by section
 #
 # Two families of targets:
-#   local  → uv-managed ./.venv (tests, lint, running a service on the host)
-#   stack  → docker compose (added layer by layer: source, kafka, spark, airflow)
+#   local  → the uv-managed ./.venv (tests, lint, running a service on the host)
+#   stack  → docker compose (grows layer by layer: source, kafka, spark, airflow)
+# The source controls are plain curl calls to the source's admin API. Read
+# them to see the HTTP contract; `jq` only formats the answers.
 #
 # .env is included, so make and docker compose see the same ports and settings.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,16 +23,22 @@ unexport VIRTUAL_ENV
 -include .env
 export
 
-UV      ?= uv
-COMPOSE ?= docker compose
+UV       ?= uv
+COMPOSE  ?= docker compose
+API      := http://localhost:$(or $(SOURCE_API_PORT),8000)
+CURL     := curl -fsS
+JSON     := -H 'content-type: application/json'
 
-.PHONY: help setup dirs test lint fmt
+.PHONY: help setup dirs test lint fmt up down ps logs \
+        source-run source-reset clock speed pause resume ff stream stats \
+        faults fault fault-rate fault-on fault-off fault-log
 
 help: ## list targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN {FS = ":.*?## "} {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+	@awk 'BEGIN {FS = ":.*?## "} \
+	  /^##@/ {printf "\n\033[1m%s\033[0m\n", substr($$0, 5)} \
+	  /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-# ── local environment ────────────────────────────────────────────────────────
+##@ Local environment
 setup: .env dirs ## create .venv (uv sync), .env (with your UID/GID) and data/ dirs
 	$(UV) sync
 
@@ -53,3 +61,72 @@ lint: ## ruff lint + format check
 
 fmt: ## ruff autofix + format
 	$(UV) run ruff check --fix . && $(UV) run ruff format .
+
+##@ Stack (docker compose)
+up: .env dirs ## build and start the stack in the background
+	$(COMPOSE) up -d --build
+
+down: ## stop the stack (data/ is kept)
+	$(COMPOSE) down
+
+ps: ## list containers and their health
+	$(COMPOSE) ps
+
+logs: ## follow logs: make logs [s=source-api]
+	$(COMPOSE) logs -f --tail=100 $(s)
+
+##@ Source: the synthetic bike-share API  (docs: http://localhost:8000/docs)
+source-run: .env dirs ## run the source on the host instead of Docker (Ctrl-C stops it)
+	SOURCE_PORT=$(or $(SOURCE_API_PORT),8000) $(UV) run python -m bikeshare_sim
+
+source-reset: ## stop the source and wipe its state: a fresh world on next start
+	-$(COMPOSE) rm -sf source-api
+	rm -f data/source/state.pkl data/source/state.pkl.bak data/source/state.tmp
+
+clock: ## show the simulated clock (sim_time, engine backlog, speed)
+	@$(CURL) $(API)/admin/clock | jq .
+
+speed: ## change speed: make speed x=600  (simulated seconds per real second)
+	@$(CURL) -X PATCH $(API)/admin/clock $(JSON) -d '{"speed": $(x)}' | jq .
+
+pause: ## freeze simulated time
+	@$(CURL) -X PATCH $(API)/admin/clock $(JSON) -d '{"paused": true}' | jq .
+
+resume: ## unfreeze simulated time
+	@$(CURL) -X PATCH $(API)/admin/clock $(JSON) -d '{"paused": false}' | jq .
+
+ff: ## fast-forward: make ff h=6 (or m=30). The skipped period arrives as a burst.
+	@$(CURL) -X POST $(API)/admin/clock/advance $(JSON) \
+	  -d '{"hours": $(or $(h),0), "minutes": $(or $(m),0)}' | jq .
+
+stream: ## watch the raw SSE stream: make stream [types=trip_started,trip_ended]
+	curl -sN "$(API)/v1/stream$(if $(types),?types=$(types))"
+
+stats: ## counters: emitted events by type, injected faults, engine internals
+	@$(CURL) $(API)/admin/stats | jq .
+
+# jq program for `make faults`: one tab-separated line per fault. It lives in a
+# variable because a backslash-newline inside a quoted recipe string would reach
+# jq verbatim.
+FAULTS_JQ := .[] | [.name, .kind, "enabled=\(.enabled)", "rate=\(.rate)", "injected=\(.injected)", \
+             (.active_episodes | map(.station_id // "whole stream") | join(","))] | @tsv
+
+faults: ## list faults: kind, enabled, rate, injected count, active episodes
+	@$(CURL) $(API)/admin/faults | jq -r '$(FAULTS_JQ)' | column -t -s $$'\t'
+
+fault: ## force one fault now: make fault f=teleport [station=ST-007]
+	@$(CURL) -X POST $(API)/admin/faults/$(f)/trigger $(JSON) \
+	  -d '$(if $(station),{"station_id": "$(station)"},{})' | jq .
+
+fault-rate: ## change a fault's rate: make fault-rate f=duplicate r=0.05
+	@$(CURL) -X PATCH $(API)/admin/faults/$(f) $(JSON) -d '{"rate": $(r)}' | jq .
+
+fault-on: ## enable a fault: make fault-on f=duplicate
+	@$(CURL) -X PATCH $(API)/admin/faults/$(f) $(JSON) -d '{"enabled": true}' | jq .
+
+fault-off: ## disable a fault: make fault-off f=duplicate
+	@$(CURL) -X PATCH $(API)/admin/faults/$(f) $(JSON) -d '{"enabled": false}' | jq .
+
+fault-log: ## the last 20 injected faults (ground truth)
+	@$(CURL) "$(API)/admin/fault-log?limit=10000" \
+	  | jq -c '.[-20:][] | {fault_id, fault_type, injected_at, event_id, details}'

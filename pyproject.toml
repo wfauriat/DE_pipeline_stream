@@ -69,6 +69,11 @@ testpaths = ["source/tests", "ingest/tests"]
 # unique names (e.g. source/tests/simkit.py), put on the path here.
 addopts = "--import-mode=importlib"
 pythonpath = ["source/tests"]
+filterwarnings = [
+    # Third-party deprecations raised inside starlette's TestClient, not in our code.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated",
+]
 
 [tool.ruff]
 line-length = 100
