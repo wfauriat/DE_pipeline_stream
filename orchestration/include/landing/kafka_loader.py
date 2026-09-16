@@ -192,3 +192,33 @@ def land_topic(
     }
     log.info("landed %s", summary)
     return summary
+
+
+# ── reset: the topic itself was deleted and created again ───────────────────
+def forget_topic(conn, topic: str) -> dict:
+    """Forget a topic's landed rows and stored positions, together, in one transaction.
+
+    Offsets number the messages of ONE topic. A topic deleted and created again
+    (`make spark-reset` does this to the alerts topic) starts over at offset 0,
+    while the positions stored here still point into the old one. The loader
+    would then skip every new message below them, silently, and a new message at
+    an offset already landed would collide with the old row's primary key.
+
+    Forgetting the rows and the positions together makes the next run land the
+    new topic from its earliest offset, like a first run. Only a reset may call
+    this, and only once Kafka confirms the old topic is gone.
+    """
+    table = warehouse.TOPIC_TABLES[topic]
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        [rows] = conn.execute(f"DELETE FROM raw.{table} WHERE topic = ?", [topic]).fetchone()
+        [positions] = conn.execute(
+            "DELETE FROM raw._kafka_offsets WHERE consumer = ? AND topic = ?",
+            [CONSUMER_GROUP, topic],
+        ).fetchone()
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    log.info("forgot %s: %d rows, %d positions", topic, rows, positions)
+    return {"topic": topic, "rows": rows, "positions": positions}

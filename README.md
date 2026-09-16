@@ -10,6 +10,9 @@ stream, lands it, transforms it and checks it for faults.
 > **Start with [`TOUR.md`](TOUR.md)**, the guided tour. It covers the architecture, the three clocks, a wiring map
 > (services, topics, delivery guarantees, where to change what), a stop-by-stop walkthrough and hands-on experiments.
 > The sections below are the per-layer quickstarts.
+>
+> **Is everything working?** `make up`, then `make smoke` (~3 min): it forces two faults and follows them
+> through every hop, from the source to the marts.
 
 ## Quickstart (layer 1: the source)
 
@@ -86,7 +89,7 @@ make alerts                 # alert counts by type + the latest ones (a host Kaf
 make lake                   # DuckDB reading Spark's Parquet in place, from the host
 make logs s=spark           # one JSON "progress" line per micro-batch and query
 open http://localhost:4040  # Spark UI → Structured Streaming tab
-make spark-reset && make up # replay everything from Kafka (checkpoints, lake, alerts wiped)
+make spark-reset && make up # replay everything from Kafka (checkpoints, lake, alerts wiped; warehouse re-lands alerts)
 COMPOSE_PROFILES= make up   # run the stack without Spark (~1.5 GB less RAM)
 ```
 

@@ -62,7 +62,18 @@ make setup        # .venv (uv), .env with your UID/GID, data/ folders
 make up           # builds images, starts 11 services (2 are one-shots that exit 0)
 make ps           # health; kafka-init and airflow-init should read "Exited (0)"
 make speed x=60   # normal pace: 1 simulated hour per real minute
+make smoke        # ~3 min: forces a teleport and a schema drift, follows both to the marts
 ```
+
+- `make smoke` (`scripts/smoke.py`) checks the running stack in pipeline order and stops at the first broken hop:
+  1. the source is healthy and not paused;
+  2. both event topics receive new events;
+  3. a forced schema drift reaches the DLQ;
+  4. all 4 Spark queries commit, and a forced teleport raises an alert;
+  5. the DAGs parse and are unpaused; it triggers `stream_landing` and `api_extract`, and `dbt_transform` follows;
+  6. the alert, the dead letter and both faults are in `raw`, the trip is flagged in `fct_trips`, and the serving copy is republished with no empty mart.
+
+  It never starts or resets anything. Its two faults go into the ground truth like any other.
 
 - `COMPOSE_PROFILES` in `.env` selects the optional parts: `stream` (Spark) and `batch` (Airflow). With the variable set to nothing (`COMPOSE_PROFILES= make up`), only the core runs: source, Kafka, bridge and Console.
 - The whole stack needs about 4.5 GB of RAM.
@@ -310,22 +321,24 @@ Run on the live file, `dbt docs generate` would hold DuckDB's single lock for se
 
 ## 5. Experiments
 
-At the default 60× pace, "a few minutes" below means real minutes. Spark reacts within about 10–30 s. The warehouse follows the next `stream_landing` run (every ≤ 5 min), followed by `dbt_transform` (about 15 s).
+At the default 60× pace, "a few minutes" below means real minutes. Spark reacts within about 10–30 s. The warehouse follows the next `stream_landing` run (every ≤ 5 min), followed by `dbt_transform` (under a minute).
 
 The scorecard also needs the fault log, extracted every 15 min, and judges only faults older than 4 simulated hours. To see a fault scored sooner, run `make trigger d=api_extract` after a few minutes.
 
+Every experiment below was run on 2026-09-16 at 60×. The numbers in parentheses were measured then.
+
 | # | Do | Watch | Expect |
 |---|---|---|---|
-| 1 | `make fault f=teleport` | `make alerts`; later in `make sql`: `SELECT * FROM marts.fct_trips WHERE is_implausible_speed` | a Spark `teleport` alert within ~20 s; the trip flagged after the next landing + dbt run; the scorecard's `teleport` rows count it |
-| 2 | `make fault f=schema_drift` (a few times) | `make dlq`; `make scorecard` → `orphan_trip`, column `explained` | the event lands in the DLQ with its error. If it was one half of a trip, the other half becomes an "orphan", counted as *explained by another fault* |
-| 3 | `make fault f=frozen_station station=ST-001` during a rush hour (07–09 or 17–19 sim) | `make scorecard` → `frozen_station` | dbt's `stale_snapshot` (snapshot-by-snapshot) usually finds it. Spark's 2-hour window only finds long episodes at busy stations |
-| 4 | `make fault f=silent_station station=ST-001` | `make alerts`, then the scorecard → `silent_station` | a Spark `silent_station` alert once the 2-hour window closes; dbt's `reporting_gap` spans the whole episode |
-| 5 | `make fault f=stream_stall` | `docker compose logs -f --no-log-prefix bridge` (keepalives, then a burst); Console lag; `make alerts` | the stream pauses 15–60 real seconds and then flushes. The backlog shows up as `late_event` (lateness ≥ 25 sim-min); rows behind Spark's watermark show in `dropped_late` |
-| 6 | `make ff h=24` | `make clock` (backlog); bridge `per_s`; Spark batch sizes (20k cap); `make warehouse` | a burst flowing through every hop; landing catches up over one or more runs |
-| 7 | `docker compose kill -s KILL bridge && docker compose start bridge` | `make quality` → `resent_by_bridge` (after the next landing + dbt run) | a few bridge re-sends (≤ 2 s of events), removed by staging dedup, never counted as source duplicates |
-| 8 | `docker compose kill -s KILL airflow-scheduler` during a `land_*` task, then `docker compose start airflow-scheduler` | the Airflow UI: the task retries after ~60–90 s; the invariant query below | no row lost or duplicated |
-| 9 | `make spark-reset && make up` | Spark UI; `make lake`; `make alerts` | Spark replays every retained Kafka message and rebuilds the lake and alerts |
-| 10 | `make pause`, wait, `make resume` | Airflow freshness warnings (`dbt source freshness` in the `dbt_transform` task logs) | no new data → no asset events → no dbt runs; freshness warns after 15 min |
+| 1 | `make fault f=teleport` | `make alerts`; later in `make sql`: `SELECT * FROM marts.fct_trips WHERE is_implausible_speed` | a Spark `teleport` alert within ~20 s (14 s); the trip flagged after the next landing + dbt run; both Spark's and dbt's `teleport` checks match the fault |
+| 2 | `make fault f=schema_drift` (a few times) | `make dlq`; `make scorecard` → `orphan_trip`, column `explained` | the event lands in the DLQ with its error. If it was one half of a trip, the other half becomes an orphan for Spark and dbt alike, counted as *explained by another fault* (3 drifts: 3 dead letters, 3 orphans) |
+| 3 | `make fault f=frozen_station station=ST-001` during a rush hour (07–09 or 17–19 sim) | `make scorecard` → `frozen_station` | dbt's `stale_snapshot` (snapshot-by-snapshot) usually finds it. Spark's 2-hour window only finds long episodes at busy stations (a 2 h 11 min freeze, split across two windows: 11 stale snapshots in dbt, nothing in Spark) |
+| 4 | `make fault f=silent_station station=ST-001` | `make alerts`, then the scorecard → `silent_station` | a Spark `silent_station` alert once a 2-hour window lies inside the episode and closes (0 status reports, while 28 trips started or ended there); dbt's `reporting_gap` spans the whole episode |
+| 5 | `make fault f=stream_stall` | bridge `throughput` lines: `docker compose logs -f --no-log-prefix bridge \| jq -c 'select(.msg=="throughput")'`; `make alerts` | the stream pauses 15–60 real seconds: `per_s` falls to 0 while `source_lag` climbs (493), then the backlog flushes in a burst. Events at least 25 sim-min late become `late_event` for Spark and dbt (233 each, for a 48-minute stall). Spark keeps the whole backlog: it arrives in order, ahead of a watermark that stood still during the stall, so `dropped_late` stays at its usual 0–2 per batch. Spark's alerts reach the warehouse one landing later than the events |
+| 6 | `make ff h=24` | `make clock` (backlog); bridge `per_s`; Spark batch sizes; `make warehouse` | a burst through every hop: the day (86,400 simulated seconds, ~16.5k events) is generated in under a second, the bridge sends it at ~550 events/s, Spark reads it in one batch (16,452 rows, under its 20k cap: `h=48` shows the cap), and one landing run catches up |
+| 7 | `docker compose kill -s KILL bridge && docker compose start bridge` | `make quality` → `resent_by_bridge` (after the next landing + dbt run) | a few bridge re-sends (2; at most 2 s of events), removed by staging dedup, never counted as source duplicates. The restart takes ~30 s, because compose re-runs `kafka-init` first |
+| 8 | `docker compose kill -s KILL airflow-scheduler` during a `land_*` task, then `docker compose start airflow-scheduler` | the Airflow UI: the task retries after ~60–90 s (79 s, as attempt 2); the invariant query below | no row lost or duplicated: the killed attempt left no batch in `raw._ingest_batches`, the retry landed the slice once |
+| 9 | `make spark-reset && make up` | Spark UI; `make lake`; `make alerts`; `make warehouse` | Spark replays every retained Kafka message in 20k-row batches (~366k messages in 3.5 min) and rebuilds the lake and the alerts topic. `spark-reset` also makes the warehouse forget the alerts it landed from the deleted topic, so the next landing re-lands the new topic from offset 0. The replayed alerts are close to the originals, not identical: fewer orphans (a late half now arrives in the same large batch as its partner: 59 fewer, all false positives), and fewer over-capacity alerts, because Spark judges old readings against today's capacities (4 fewer, all at ST-024, which grew from 36 to 40 docks since; dbt's as-of join still counts them) |
+| 10 | `make pause`, wait ~25 min, `make resume` | `stream_landing` runs (task `report`); `dbt_transform` runs and what triggered them (Assets view); freshness in their `source_freshness` task log | `stream_landing` lands nothing, so `report` is skipped and emits no `raw_stream` event. dbt keeps running anyway: `api_extract` emits `raw_api` every 15 min, because its `report` never skips. Once the last landed event is 15 min old, those runs warn on `raw.trip_events` and `raw.station_status` (`stations` passes: every extract refreshes it); the runs still succeed. (Paused 21:09; last rows landed 21:13; the run triggered by the 21:33 extract warned) |
 
 **The exactly-once invariant** (experiment 8). Open the *warehouse* read-only: the `raw` schema isn't in the serving copy. Retry if a DAG is writing at that moment.
 
@@ -383,7 +396,7 @@ Useful resets:
 |---|---|
 | `make source-reset` | the world only (breaks consistency; prefer `make reset`) |
 | `make bridge-reset` | the bridge checkpoint: it replays the source buffer |
-| `make spark-reset` | Spark's checkpoints, lake and alerts topic: a replay from Kafka |
+| `make spark-reset` | Spark's checkpoints, lake and alerts topic, and the alerts the warehouse landed from that topic: a replay from Kafka, re-landed from offset 0 |
 | `make reset` | everything, consistently |
 
 **Exploring without lock conflicts:** use the serving copy (`make sql`). For raw or staging, work on a private copy:
@@ -399,7 +412,6 @@ COPY FROM DATABASE live TO mine;
 
 ## 8. What is not here (yet)
 
-- **`make smoke`:** a scripted end-to-end check from an empty stack (planned, layer 6).
 - **A dashboard** on the serving copy, e.g. Streamlit (optional, layer 6).
 - **Natural extensions:**
   - Schema Registry (Avro or Protobuf) instead of JSON;

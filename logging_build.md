@@ -15,7 +15,7 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ✅ done (review deferred) | 2026-09-16 | `9611496` |
-| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏳ in progress: `TOUR.md` done, `make dbt-docs` lock fix; smoke script and dashboard remain | 2026-09-16 | `b91c03e` (tour) |
+| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏸ waiting for your review: `TOUR.md` checked by running its 10 experiments, `make smoke`, fixes for `make dbt-docs` and `make spark-reset`. The Streamlit dashboard is optional: your call | 2026-09-16 | `b91c03e` (tour), `cefc82d` (dbt-docs), then the spark-reset + smoke commit |
 
 Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 
@@ -328,6 +328,42 @@ Things to know:
   - frozen: dbt `stale_snapshot` 100% recall at 42% precision, 71% counting the teleport-explained ones; Spark 0/3 (short episodes).
 - Resources: stack ~4.5 GB RAM; disk 6.3 GB free.
 
+### Layer 6: the guided tour, checked by running it (2026-09-16)
+
+| Path | Purpose |
+|---|---|
+| `TOUR.md` | The guided tour (commit `b91c03e`). Corrected after running every experiment: the measured values are now in the experiments table. |
+| `scripts/copy_warehouse_schema.py` | Structure-only copy of the warehouse, for `make dbt-docs` (commit `cefc82d`, see decisions). |
+| `orchestration/include/landing/kafka_loader.py` | Adds `forget_topic()`: a topic's landed rows and stored positions deleted in one transaction. |
+| `scripts/forget_landed_topic.py` | Waits until Kafka confirms the topic is gone, then calls `forget_topic()`. Does nothing without a warehouse or raw schema, or when Kafka is unreachable (the topic was not deleted either); gives up with exit 1 if the topic still exists after 30 s. |
+| `Makefile` | `spark-reset` calls `forget_landed_topic.py bikeshare.alerts.v1` after deleting the topic. New target `smoke`. |
+| `scripts/smoke.py` | `make smoke`: end-to-end check of the running stack, in pipeline order, stopping at the first broken hop: source healthy and not paused → new events in both topics → a forced schema drift in the DLQ → all 4 Spark queries commit and a forced teleport raises an alert → DAGs parsed and unpaused, `stream_landing` + `api_extract` triggered through the REST API, then a `dbt_transform` run after them → alert, dead letter and both faults in `raw`, the trip flagged in `fct_trips`, serving copy republished with no empty mart. Skips the Spark or Airflow steps when their compose profile is off. |
+| `orchestration/tests/test_kafka_loader.py` | +2 tests: a recreated topic is skipped below the old positions (the bug), and after `forget_topic()` it lands from offset 0 with no primary-key collision, other topics untouched. 16 orchestration tests pass. |
+
+**The 10 experiments of `TOUR.md` §5, run at 60× on a world ~22 simulated days old (~360k messages in Kafka):**
+
+| # | Experiment | Result |
+|---|---|---|
+| 1 | teleport | ✅ Spark alert 14 s after injection (85.7 km/h); `fct_trips.is_implausible_speed`; matched by Spark and dbt `teleport`. |
+| 2 | schema_drift ×3 | ✅ 3 dead letters, all `trip_started`; their `trip_ended` became orphans for Spark and dbt, each with its partner in the DLQ ("explained"). |
+| 3 | frozen ST-002, 17:00–19:11 sim | ✅ dbt `stale_snapshot` ×11 matched the episode; Spark nothing (the episode spans two 2 h windows, neither fully frozen). |
+| 4 | silent ST-001, 13:05–16:13 sim | ✅ Spark `silent_station` on 14:00–16:00 (0 reports, 20 departures, 8 arrivals); dbt `reporting_gap` ×1. |
+| 5 | stream_stall, 48 sim-min | ✅ bridge `per_s` 0.0 with `source_lag` 493, then a burst; 233 `late_event` from Spark and from dbt. ⚠️ Tour corrected: the bridge logs no keepalives, and Spark drops none of the backlog (see known issues). Spark's alerts reached the warehouse one landing after the events. |
+| 6 | ff h=24 | ✅ 86,418 s of backlog generated in < 1 s; bridge 553 events/s; one Spark batch of 16,452 rows (under the 20k cap); one landing run to catch up. |
+| 7 | SIGKILL bridge | ✅ `resent_by_bridge` = 2, not counted as source duplicates. The restart took 27 s (compose re-ran `kafka-init`). |
+| 8 | SIGKILL scheduler during `land_station_status` | ✅ retried as attempt 2, 79 s after the kill; rows = distinct offsets = stored positions for both event tables; the run holds one batch per topic. |
+| 9 | spark-reset + up | ✅ replay of ~366k messages in 20k-row batches, 3.5 min; lake and alerts rebuilt. 🐞 Found the bug fixed below: 85 replayed alerts never reached the warehouse. Replay ≠ live: 59 fewer orphans (all false positives whose late half now shares a batch with its partner), 4 fewer over_capacity (ST-024, capacity 36 → 40 since). |
+| 10 | pause, 21:09–21:35 | ✅ `stream_landing` landed the last events at 21:13, then skipped `report` at 21:18, 21:23, 21:28, 21:33: no `raw_stream` event. ⚠️ Tour corrected: dbt did NOT stop. `dbt_transform` ran after each `api_extract` (`raw_api`, whose report never skips): at 21:18 freshness passed; at 21:33 it warned on `raw.trip_events` and `raw.station_status` (`stations` passed) and the run succeeded. |
+
+**The `spark-reset` fix, verified live** (21:35, after resuming the source): the target printed "forgot 4,194 rows and 3 stored positions"; Spark replayed; the 21:38 landing started at offset 0 on every partition (3,943 alerts, mid-replay), the 21:43 one continued (267). Then: warehouse rows = distinct offsets = stored positions = 4,210, 0 topic messages missing below the positions, 4 waiting for the next run.
+
+**`make smoke`, on the running stack:**
+
+- First run: steps 1–5 passed, step 6 failed on its own SQL (DuckDB's `->>` binds more loosely than `=` and `AND`: parentheses added).
+- Second run: passed in 2 min 43 s (teleport TR-00055609 at 83.1 km/h, from source to `fct_trips`).
+- Third run, with the final code (readiness waits added): passed in 1 min 43 s.
+- Not run from an empty stack (`make reset && make up && make smoke`): that wipes the world. It waits up to 60 s for the source and 180 s for the DAGs to parse, for that case.
+
 ## Decisions and deviations from the plan
 
 | Date | Decision | Why |
@@ -378,6 +414,11 @@ Things to know:
 | 2026-09-16 | dbt pinned to the Airflow image's versions (`dbt-core==1.12.5`, `dbt-duckdb==1.11.0`) in the `warehouse` group. | The same dbt on the host and in Airflow, over the same file. |
 | 2026-09-16 | The end-to-end check ran after `make reset`. | The source fix only applies to new data, and it proves the whole pipeline starts from zero. |
 | 2026-09-16 | **`make dbt-docs` builds the catalog from a structure-only copy** of the warehouse (`scripts/copy_warehouse_schema.py`: read-only open that waits for the lock, `COPY FROM DATABASE … (SCHEMA)`, into `transform/target-docs/bikeshare.duckdb`). | You saw `make dbt-docs` fail: `dbt.log` showed `Could not set lock … held in python3.12`, Airflow's `dbt build` (~23 s at 600×, every 2.5–5 min). The catalog needs no rows; the copy takes ~0.2 s and waits for the lock (tested with a 6 s holder). The file must be named `bikeshare.duckdb`: dbt-duckdb names the database after the file, and the docs showed `"docs_catalog"."marts"…` otherwise. |
+| 2026-09-16 | **`make spark-reset` also forgets the alerts landed in the warehouse**: `raw.alerts` rows and the loader's positions for `bikeshare.alerts.v1`, in one transaction, once Kafka confirms the topic is gone (`scripts/forget_landed_topic.py` → `kafka_loader.forget_topic`). The next landing re-lands the recreated topic from offset 0. | Found by experiment 9. The stored positions numbered the DELETED topic's messages; the recreated one starts over at 0, so the loader landed nothing while the new topic was shorter, then only the offsets above the old positions: 85 replayed alerts never reached the warehouse (83 newer than any landed before). Positions alone can't be reset: re-landed offsets would collide with the old rows' primary key. Waiting for Kafka matters because deletion is asynchronous: a landing that still saw the old topic would re-land it. The replay regenerates the forgotten alerts from Kafka's retention. |
+| 2026-09-16 | `make smoke` checks the RUNNING stack and never starts, stops or resets anything. From scratch: `make reset && make up && make smoke`. | A target that resets on its own would wipe your world by accident. The side effects it has are the ones any user of the stack has: two forced faults (recorded in the ground truth, so the scorecard stays honest) and two DAG runs outside their schedule. |
+| 2026-09-16 | Smoke checks the injected faults row by row (raw tables, `fct_trips`), not through the scorecard's precision and recall. PLAN §13 said "the scorecard shows the injected fault as detected". | The scorecard judges only faults older than 4 simulated hours (and needs the fault log extracted), which would add minutes to every run. The row checks follow the same keys the scorecard matches on. |
+| 2026-09-16 | Smoke triggers DAGs through Airflow's REST API (`POST /api/v2/dags/{id}/dagRuns`, `logical_date: null`). | No login needed locally (checked: a probe on an unknown DAG returned 404, not 401), and it returns the run id to follow, unlike the CLI's table output. |
+| 2026-09-16 | No topic-identity guard in the loader (yet). | Kafka's topic id (`AdminClient.describe_topics`) would let the loader refuse positions from another incarnation of a topic. `make spark-reset` is the only path that deletes a topic, and it now resets the positions; the guard would also cover a topic deleted by hand. Left as a known issue. |
 | 2026-09-16 | dbt on the host writes `transform/target-host/`, `target-docs/` and `logs-host/` (`DBT_TARGET_PATH`, `DBT_LOG_PATH` in the Makefile). `target/` and `logs/` are Airflow's. | Both runners shared one folder: the log showed their lines interleaved; a host run writes `target/run_results.json` (checked: `docs generate` writes one), which `quality_report` reads right after `dbt_build`; and they overwrote each other's parse cache, built with different env (`DUCKDB_PATH`, `LAKE_DIR`). |
 
 ## Pinned versions
@@ -425,9 +466,13 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **The Console's topic list includes `__consumer_offsets`**, Kafka's internal topic. `make topics` hides it.
 - **Rebuilding an image recreates its container.** Any change to the root `pyproject.toml` or `uv.lock` rebuilds both Python images, because both copy them. Code-only changes rebuild just the affected image.
 - **Spark: frozen_station recall is ~40%.** Episodes that are short, or at quiet stations and hours, cannot fill a 2 h window with evidence. The exact snapshot-to-snapshot check (LAG plus the trips in between) is planned in dbt (layer 5). Comparing the two is a good use of the scorecard.
-- **Spark: orphan_trip precision is ~66%** because of secondary effects (partners dead-lettered by the bridge). Layer 5's scorecard should attribute these to schema_drift rather than count them as plain false positives.
+- **Spark: orphan_trip precision is ~56–66%** because of secondary effects. Layer 5's scorecard attributes the orphans whose partner was dead-lettered (schema drift). Experiment 9 found a second cause, not attributed yet: a half that arrives ≥ 25 sim-min late (late_event fault or stall backlog) after the watermark closed the pairing. 59 of the live orphans were such cases; a replay, whose large batches hold both halves, paired them all. Candidate "explained" rule: the partner exists with `lateness_min ≥ late_after_min`.
+- **Spark's `over_capacity` judges every event against today's capacities** (reference data refreshed from the API). Live, that is the capacity valid at the time; in a replay, readings over an old, smaller capacity are missed (4 at ST-024, 36 → 40 docks). dbt's as-of join on the SCD2 snapshot has no such gap.
+- **The loader cannot tell a recreated topic from the original.** Positions carry no topic id, so a topic deleted by hand (outside `make spark-reset`) would be skipped below the old positions, silently. Guard to add: store Kafka's topic id with the positions and fail on a mismatch.
 - **Spark: `input_rows` for `trip_pairing` is 2× the Kafka rows.** Both sides of the self-join scan the source. That is inherent and harmless at this volume.
-- **Spark drops rows behind the watermark, and they are counted.** Over the final replay the progress lines added up to `dropped_late` = 10 (late events and stall backlog more than 30 simulated minutes behind) and `dropped_duplicates` = 914. Only the stateless `reference_rules` query still sees those late rows, which is why `late_event` is detected there.
+- **Spark drops rows behind the watermark, and they are counted.** Over the layer 3 replay the progress lines added up to `dropped_late` = 10 and `dropped_duplicates` = 914. Only the stateless `reference_rules` query still sees those late rows, which is why `late_event` is detected there.
+  - A **stall's backlog is not dropped** (experiment 5, 2026-09-16): the watermark stands still while nothing arrives, and the backlog then comes in order, ahead of it. `dropped_late` stayed at its usual 1–2 per batch. What gets dropped are `late_event` faults: single events delayed while others keep moving the watermark.
+- **A replay is not a rerun of the live stream.** Batch sizes change how the watermark advances (orphans above), and the reference data is today's (over_capacity above). Stateless per-event rules (teleport) and the 2 h station windows came out identical.
 - **PySpark pitfall:** `collect()` returns naive datetimes in the Python process's local timezone (seen in the tests on this Paris-time host). The container runs in UTC.
 - **Spark's Parquet sink records its commits in `_spark_metadata/`.** DuckDB's glob ignores that log, so a crashed batch's uncommitted file could be counted. That is acceptable here.
 - **Changing `spark.sql.shuffle.partitions` or any stateful query's shape** requires `make spark-reset`. The checkpoints remember both.
@@ -440,10 +485,10 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **At high simulation speed, the fault log lags** (extracted every 15 real minutes = 6 simulated days at 600×), so the scorecard judges an older horizon. `make trigger d=api_extract` refreshes it, and the asset event then rebuilds the marts.
 - **`stale_snapshot` still has unexplained false positives** (~29% of detections in the fresh run). Likely causes: dead-lettered or dropped trip events at the station, and silent rebalancing coinciding with trips. Candidate attributions to add.
 - **Spark's `frozen_station` found 0 of 3 frozen episodes in the fresh run** (short episodes). dbt's exact check found 3 of 3. That contrast is the point of having both.
-- **dbt rebuilds everything except `fct_trips` on each run** (views and tables). About 4–15 s at this volume. Incremental marts would be the next step at scale.
-- **The stack was left running at 600× speed** (set during layer 5's end-to-end check). `make speed x=60` restores the normal pace, as `TOUR.md` §1 says.
+- **dbt rebuilds everything except `fct_trips` on each run** (views and tables). About 4–15 s at layer 5's volume; ~23 s for `dbt build` and 35–55 s for the whole `dbt_transform` run at ~360k events (2026-09-16). Incremental marts would be the next step at scale.
+- **Speed after a restart** comes from `.env` (`SIM_SPEED=60`): runtime controls such as `make speed` reset at every source restart.
 - **Layer 6 so far:** `TOUR.md` is written (2026-09-16, at the end of a long session, from the full build context). It covers: the whole picture, start-up, the three clocks, a wiring map (services, topics, consumer positions, delivery guarantees, "change X → edit Y"), a stop-by-stop tour, 10 experiments with expected outcomes, how to read the scorecard, where state lives, and what is missing.
-  - **Not yet re-verified command by command.** You ran a quick pass over the commands (2026-09-16): they worked except `make dbt-docs` (lock, now fixed). The §1 service count was also corrected (11 services including the 2 one-shots). The 10 experiments are still unchecked.
-- **Next (rest of layer 6):**
-  - `scripts/smoke.py` (`make smoke`): an end-to-end check from an empty stack (source healthy → topics filling → Spark alerts → landing → dbt → serving copy → scorecard rows);
-  - optional Streamlit dashboard on the serving copy.
+  - **Verified (2026-09-16).** You ran a quick pass over the commands: they worked except `make dbt-docs` (lock, fixed in `cefc82d`). The §1 service count was corrected (11 services including the 2 one-shots). All 10 experiments were then run (results in "Layer 6" above). The drifts found were fixed in `TOUR.md` (the expectations of experiments 5 and 10, the `dbt_transform` duration, measured values added), and experiment 9 found the `spark-reset` alerts bug (fixed).
+- **`make smoke` was verified on a running stack only**, not right after `make reset && make up` (see "Layer 6").
+- **Each `make smoke` adds two faults to the world** (a teleport and a schema drift). They are real faults for the scorecard: their detections count as true ones.
+- **Next:** your review of layer 6. Optional: a Streamlit dashboard on the serving copy.

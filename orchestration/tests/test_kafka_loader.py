@@ -150,3 +150,31 @@ def test_expired_offsets_restart_at_the_earliest_retained(db):
 def test_a_run_is_capped_per_partition(db):
     kafka_loader.land_topic(db, FakeConsumer({0: 10}), TOPIC, run_id="r1", max_per_partition=4)
     assert row_count(db) == 4 and stored_offsets(db) == {0: 4}
+
+
+def test_a_recreated_topic_is_skipped_below_the_old_positions(db):
+    """The bug `make spark-reset` used to cause: the loader trusts positions from the deleted topic."""
+    kafka_loader.land_topic(db, FakeConsumer({0: 5}), TOPIC, run_id="run-1")
+    recreated = FakeConsumer({0: 7})  # a new topic, offsets 0..6
+    summary = kafka_loader.land_topic(db, recreated, TOPIC, run_id="run-2")
+    assert summary["partitions"] == {0: [5, 7]}  # offsets 0..4 of the new topic: never landed
+
+
+def test_forgetting_a_recreated_topic_relands_it_from_the_start(db):
+    kafka_loader.land_topic(db, FakeConsumer({0: 5, 1: 2}), TOPIC, run_id="run-1")
+    other = ["duckdb-loader", "bikeshare.dlq.v1", 0, 9, "2026-01-01 00:00:00+00"]
+    db.execute("INSERT INTO raw._kafka_offsets VALUES (?, ?, ?, ?, ?)", other)
+
+    forgotten = kafka_loader.forget_topic(db, TOPIC)
+
+    assert forgotten == {"topic": TOPIC, "rows": 7, "positions": 2}
+    assert row_count(db) == 0
+    assert db.execute("SELECT topic, next_offset FROM raw._kafka_offsets").fetchall() == [
+        ("bikeshare.dlq.v1", 9)  # other topics keep their positions
+    ]
+    summary = kafka_loader.land_topic(db, FakeConsumer({0: 3}), TOPIC, run_id="run-2")
+    assert summary["partitions"] == {0: [0, 3]}  # from offset 0, and no primary-key collision
+    assert row_count(db) == 3
+    assert db.execute(
+        'SELECT "partition", next_offset FROM raw._kafka_offsets WHERE topic = ?', [TOPIC]
+    ).fetchall() == [(0, 3)]

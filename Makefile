@@ -39,7 +39,7 @@ API      := http://localhost:$(or $(SOURCE_API_PORT),8000)
 CURL     := curl -fsS
 JSON     := -H 'content-type: application/json'
 
-.PHONY: help setup dirs test lint fmt up down ps logs reset \
+.PHONY: help setup dirs test lint fmt up down ps logs smoke reset \
         source-run source-reset clock speed pause resume ff stream stats \
         faults fault fault-rate fault-on fault-off fault-log \
         topics tail dlq bridge-run bridge-reset alerts lake spark-reset \
@@ -87,6 +87,12 @@ ps: ## list containers and their health (one-shot ones too: kafka-init)
 
 logs: ## follow logs: make logs [s=source-api]
 	$(COMPOSE) logs -f --tail=100 $(s)
+
+# Checks the RUNNING stack, hop by hop (scripts/smoke.py). It forces two faults and
+# triggers two DAG runs, but never starts or resets anything. From an empty stack:
+# make reset && make up && make smoke
+smoke: ## end-to-end check of the running stack: forces a teleport and a schema drift, follows them to the marts
+	@PYTHONPATH=orchestration/include $(UV) run python scripts/smoke.py
 
 # The pieces of state must stay consistent with each other. The bridge's
 # checkpoint is a seq of the source's stream, Kafka holds what was sent up to
@@ -190,11 +196,15 @@ lake: ## Spark's Parquet output (station metrics), read in place by DuckDB from 
 
 # Resetting a job means resetting its progress AND its outputs together:
 # replaying into a lake and topic that already hold the old results duplicates them.
-spark-reset: ## stop Spark, wipe its checkpoints, lake and alerts topic (replays from the earliest offsets)
+# Downstream too: the warehouse's stored positions number the messages of the DELETED
+# alerts topic, and the recreated one starts over at offset 0. So the alerts landed
+# from it are forgotten with their positions, once Kafka confirms the topic is gone.
+spark-reset: ## stop Spark, wipe its checkpoints, lake, alerts topic and the alerts landed from it (replays from the earliest offsets)
 	-$(COMPOSE) rm -sf spark
 	-$(KAFKA_BIN)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic bikeshare.alerts.v1
 	rm -rf data/checkpoints/* data/lake/*
-	@echo "next: make up (kafka-init re-creates the alerts topic, Spark starts over)"
+	@PYTHONPATH=orchestration/include $(UV) run python scripts/forget_landed_topic.py bikeshare.alerts.v1
+	@echo "next: make up (kafka-init re-creates the alerts topic, Spark starts over, the next landing re-lands it)"
 
 ##@ Airflow and the warehouse  (Airflow UI: http://localhost:8080)
 # The Airflow CLI runs inside the scheduler container, against the metadata database.
