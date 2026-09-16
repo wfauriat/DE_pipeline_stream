@@ -14,8 +14,8 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ✅ done | 2026-09-15 | `04dede1` |
 | 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
-| 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⏸ waiting for your review | 2026-09-16 | "Layer 5" commit |
-| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⬜ todo | | |
+| 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ✅ done (review deferred) | 2026-09-16 | `9611496` |
+| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏳ in progress: `TOUR.md` done; smoke script and dashboard remain | 2026-09-16 | "Guided tour" commit |
 
 Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 
@@ -36,6 +36,7 @@ runnable layer:
 |---|---|---|
 | 3: Spark analyzer | `87929c4` | "Layer 3: Spark analyzer" |
 | 4: Airflow and the landing zone | `dbfff54` | "Layer 4: Airflow and the DuckDB landing zone" |
+| 5: dbt, scorecard, serving copy | `9611496` | "Layer 5: dbt, the scorecard and the serving copy" |
 
 To replay one:
 
@@ -437,9 +438,9 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **`stale_snapshot` still has unexplained false positives** (~29% of detections in the fresh run). Likely causes: dead-lettered or dropped trip events at the station, and silent rebalancing coinciding with trips. Candidate attributions to add.
 - **Spark's `frozen_station` found 0 of 3 frozen episodes in the fresh run** (short episodes). dbt's exact check found 3 of 3. That contrast is the point of having both.
 - **dbt rebuilds everything except `fct_trips` on each run** (views and tables). About 4–15 s at this volume. Incremental marts would be the next step at scale.
-- **Next (layer 6):**
-  - README guided tour (a start-to-finish walkthrough, what to open where);
-  - wiring map: every service ↔ host:port ↔ env var ↔ file;
-  - the "three clocks" explained once;
+- **The stack was left running at 600× speed** (set during layer 5's end-to-end check). `make speed x=60` restores the normal pace, as `TOUR.md` §1 says.
+- **Layer 6 so far:** `TOUR.md` is written (2026-09-16, at the end of a long session, from the full build context). It covers: the whole picture, start-up, the three clocks, a wiring map (services, topics, consumer positions, delivery guarantees, "change X → edit Y"), a stop-by-stop tour, 10 experiments with expected outcomes, how to read the scorecard, where state lives, and what is missing.
+  - **Not yet re-verified command by command:** a new session should walk the tour once and fix any drift.
+- **Next (rest of layer 6):**
   - `scripts/smoke.py` (`make smoke`): an end-to-end check from an empty stack (source healthy → topics filling → Spark alerts → landing → dbt → serving copy → scorecard rows);
   - optional Streamlit dashboard on the serving copy.

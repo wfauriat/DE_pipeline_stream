@@ -7,7 +7,9 @@ stream, lands it, transforms it and checks it for faults.
 - [`PLAN.md`](PLAN.md): the request, the architecture and the design decisions.
 - [`logging_build.md`](logging_build.md): what is built so far and what comes next.
 
-> This README grows with each layer. The full guided tour comes in layer 6.
+> **Start with [`TOUR.md`](TOUR.md)**, the guided tour. It covers the architecture, the three clocks, a wiring map
+> (services, topics, delivery guarantees, where to change what), a stop-by-stop walkthrough and hands-on experiments.
+> The sections below are the per-layer quickstarts.
 
 ## Quickstart (layer 1: the source)
 
