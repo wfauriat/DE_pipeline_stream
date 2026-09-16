@@ -105,3 +105,40 @@ never saw it: one fault showing up as another.
 
 Frozen recall is limited by episodes too short, or at stations too quiet, to fill
 a 2-hour window. The exact check is sequential and comes in layer 5, with dbt.
+
+## Layer 4: Airflow and the DuckDB landing zone
+
+Airflow 3 (`orchestration/`) schedules two DAGs that fill the warehouse's `raw`
+schema, `data/warehouse/bikeshare.duckdb`:
+
+| DAG | every | what | outlet asset |
+|---|---|---|---|
+| `stream_landing` | 5 min | the four Kafka topics → `raw.trip_events`, `raw.station_status`, `raw.dlq`, `raw.alerts` | `raw_stream` |
+| `api_extract` | 15 min | the source API → `raw.stations`, `raw.bikes` (snapshots), `raw.weather`, `raw.fault_log` (incremental) | `raw_api` |
+
+Landing is **exactly once**. Each run reads a bounded slice of each partition,
+then writes the rows *and* the new Kafka position in one DuckDB transaction.
+`orchestration/include/landing/kafka_loader.py` explains why that works. It was
+checked by killing the scheduler mid-landing: no row lost, none duplicated.
+
+```bash
+make dags                    # the DAGs, paused state, import errors
+make runs d=stream_landing   # latest runs
+make trigger d=api_extract   # run a DAG now
+make warehouse               # rows per raw table, loader positions vs Kafka, latest batches
+make sql                     # harlequin on the warehouse, read-only
+open http://localhost:8080   # Airflow UI (no login locally): graphs, logs, Assets, Pools
+```
+
+Wiring worth reading:
+
+- **Connections and variable:** set as environment variables in the
+  `x-airflow-common` block of `docker-compose.yml` (`AIRFLOW_CONN_*`,
+  `AIRFLOW_VAR_*`). Nothing is clicked in the UI.
+- **Pool `duckdb`:** one slot, because DuckDB allows a single writer. Every
+  writing task queues there.
+- **Assets:** `raw_stream` and `raw_api` carry row counts. Layer 5's dbt DAG
+  will run on them instead of a clock.
+
+The landing code is plain Python (`orchestration/include/landing/`), unit-tested
+without Airflow; the DAGs only schedule it.

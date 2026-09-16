@@ -10,9 +10,70 @@
 # ports (left side of "ports:") are only for you: browser, curl, local tools.
 #
 # This file grows layer by layer:
-#   1 source-api · 2 kafka, kafka-init, bridge, console · 3 spark · 4–5 airflow
+#   1 source-api · 2 kafka, kafka-init, bridge, console · 3 spark
+#   4 airflow-db, airflow-init, airflow-apiserver, airflow-scheduler, airflow-dag-processor
 # ─────────────────────────────────────────────────────────────────────────────
 name: de-modern
+
+# ── Shared by every Airflow service (layer 4) ─────────────────────────────────
+# An "extension field" (x-…) with a YAML anchor (&…): each Airflow service
+# below merges it with `<<: *airflow-common`, so image, env and mounts are
+# declared once.
+x-airflow-common: &airflow-common
+  profiles: ["batch"]                     # started when COMPOSE_PROFILES includes "batch"
+  build:
+    context: .
+    dockerfile: orchestration/Dockerfile
+  image: de-modern/airflow:dev
+  # Your UID, group root: the Airflow image makes its folders group-root writable
+  # for exactly this, and files written into ./data stay yours.
+  user: "${HOST_UID:-1000}:0"
+  environment: &airflow-common-env
+    # ── Airflow itself (AIRFLOW__<SECTION>__<KEY> overrides airflow.cfg) ──
+    # LocalExecutor: the scheduler runs tasks as its own subprocesses. There
+    # is no Celery or Redis; a single machine doesn't need a worker fleet.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Airflow 3: tasks talk to the API server (not to the database directly),
+    # through the Execution API, authenticated with JWTs signed by this shared secret.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-only-jwt-secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: de-modern
+    # No login locally: the simple auth manager treats every visitor as admin.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Recovering tasks whose process died. Until recovery, such a task stays
+    # "running" and HOLDS ITS POOL SLOT, and the `duckdb` pool has only one, so
+    # every write waits. Two mechanisms, both 300 s by default (measured here: a
+    # killed scheduler blocked landing for 5 minutes):
+    #   - the scheduler itself died: on restart, it resets its predecessor's tasks
+    #     at the next orphaned-tasks check;
+    #   - only the task process died: it is failed once its heartbeats have been
+    #     missing for the heartbeat timeout.
+    # Failed tasks are then retried (retries=2 in the DAGs).
+    AIRFLOW__SCHEDULER__ORPHANED_TASKS_CHECK_INTERVAL: "60"
+    AIRFLOW__SCHEDULER__TASK_INSTANCE_HEARTBEAT_TIMEOUT: "90"
+    # Pick up new or edited DAG files within 30 s (default: 5 min).
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+    # include/landing: the code the DAGs call, importable as `landing`.
+    PYTHONPATH: /opt/airflow/include
+    # ── What the DAGs connect to: Airflow Connections and Variables from env ──
+    # AIRFLOW_CONN_<ID> defines connection <id> (lower-cased), AIRFLOW_VAR_<KEY>
+    # variable <key>. Nothing is stored in Airflow's database, and nothing is clicked in the UI.
+    AIRFLOW_CONN_KAFKA_LANDING: '{"conn_type": "generic", "extra": {"bootstrap.servers": "kafka:9092"}}'
+    AIRFLOW_CONN_BIKESHARE_API: '{"conn_type": "http", "schema": "http", "host": "source-api", "port": 8000}'
+    AIRFLOW_VAR_WAREHOUSE_PATH: /data/warehouse/bikeshare.duckdb
+  volumes:
+    - ./orchestration/dags:/opt/airflow/dags          # DAG files: edit on the host, no rebuild
+    - ./orchestration/include:/opt/airflow/include    # the `landing` package
+    - airflow-logs:/opt/airflow/logs                  # task logs, shared by scheduler and API server
+    - ./data/warehouse:/data/warehouse                # the DuckDB file (written by the DAGs)
+    - ./data/lake:/data/lake:ro                       # Spark's Parquet output (read by dbt, layer 5)
+  depends_on: &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
 
 services:
   # ── Layer 1: the synthetic upstream system (the "vendor") ───────────────────
@@ -187,5 +248,92 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  # ── Layer 4: orchestration (Airflow 3) ──────────────────────────────────────
+  airflow-db:
+    # Airflow's metadata database: DAG runs, task states, pools. Not the warehouse.
+    profiles: ["batch"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped                 # no host port: only Airflow talks to it
+
+  airflow-init:
+    # One-shot: migrates the metadata database, then creates the `duckdb` pool.
+    # It keeps the image's entrypoint, which does the setup: `airflow db migrate`
+    # (because of _AIRFLOW_DB_MIGRATE) and the environment for an arbitrary UID
+    # (HOME, and the PYTHONPATH where Airflow is installed). Only then does it run the command.
+    <<: *airflow-common
+    command: ["bash", "-c", "airflow pools set duckdb 1 'DuckDB allows one writer at a time: writing tasks queue here'"]
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+    restart: "no"
+
+  airflow-apiserver:
+    # REST API + web UI (http://localhost:8080), and the Execution API the tasks report to.
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    # Decides what runs when, and runs it (LocalExecutor). The tasks execute in
+    # this container, which is why it needs Kafka and the source API reachable.
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+      source-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    # Parses DAG files into the metadata DB (in Airflow 3 this is a separate process).
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # No triggerer: none of these DAGs use deferrable operators. Add one if a DAG does.
+
 volumes:
   kafka-data:
+  airflow-db:
+  airflow-logs:

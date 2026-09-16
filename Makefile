@@ -25,7 +25,7 @@ export
 
 # Optional parts of the stack (compose profiles). Default: all of them.
 # Override in .env, or per command: `COMPOSE_PROFILES= make up` = core only.
-COMPOSE_PROFILES ?= stream
+COMPOSE_PROFILES ?= stream,batch
 
 # By default BuildKit attaches a timestamped provenance attestation to every
 # image. The image ID then changes on every build, even when every layer comes
@@ -42,7 +42,8 @@ JSON     := -H 'content-type: application/json'
 .PHONY: help setup dirs test lint fmt up down ps logs reset \
         source-run source-reset clock speed pause resume ff stream stats \
         faults fault fault-rate fault-on fault-off fault-log \
-        topics tail dlq bridge-run bridge-reset alerts lake spark-reset
+        topics tail dlq bridge-run bridge-reset alerts lake spark-reset \
+        dags runs trigger warehouse sql
 
 help: ## list targets
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -89,12 +90,12 @@ logs: ## follow logs: make logs [s=source-api]
 
 # The pieces of state must stay consistent with each other. The bridge's
 # checkpoint is a seq of the source's stream, Kafka holds what was sent up to
-# it, and Spark's checkpoints are offsets into those Kafka topics. So reset
-# them together.
-reset: ## stop everything and wipe ALL state: world, checkpoints, Kafka topics, lake
+# it, and Spark's checkpoints and the warehouse's stored offsets are positions
+# in those Kafka topics. So reset them together.
+reset: ## stop everything and wipe ALL state: world, checkpoints, topics, lake, warehouse, Airflow DB
 	$(COMPOSE) --profile '*' down -v
 	rm -f data/source/state.* data/bridge/checkpoint.*
-	rm -rf data/checkpoints/* data/lake/*
+	rm -rf data/checkpoints/* data/lake/* data/warehouse/*
 
 ##@ Source: the synthetic bike-share API  (docs: http://localhost:8000/docs)
 source-run: .env dirs ## run the source on the host instead of Docker (Ctrl-C stops it)
@@ -194,3 +195,28 @@ spark-reset: ## stop Spark, wipe its checkpoints, lake and alerts topic (replays
 	-$(KAFKA_BIN)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic bikeshare.alerts.v1
 	rm -rf data/checkpoints/* data/lake/*
 	@echo "next: make up (kafka-init re-creates the alerts topic, Spark starts over)"
+
+##@ Airflow and the warehouse  (Airflow UI: http://localhost:8080)
+# The Airflow CLI runs inside the scheduler container, against the metadata database.
+# Through /entrypoint: `docker compose exec` skips the image's entrypoint, and
+# without it Python can't find Airflow when the container runs as your UID.
+AIRFLOW := $(COMPOSE) exec -T airflow-scheduler /entrypoint airflow
+
+dags: ## DAGs, with paused state and import errors (if any)
+	@$(AIRFLOW) dags list -o table 2>/dev/null
+	@$(AIRFLOW) dags list-import-errors 2>/dev/null | grep -v "^No data found" || true
+
+runs: ## latest runs of a DAG: make runs [d=stream_landing]
+	@$(AIRFLOW) dags list-runs $(or $(d),stream_landing) -o table 2>/dev/null | head -12
+
+trigger: ## run a DAG now, outside its schedule: make trigger d=api_extract
+	@$(AIRFLOW) dags trigger $(d) -o table 2>/dev/null
+
+# PYTHONPATH mirrors the Airflow containers, so the script uses the same `landing` package.
+warehouse: ## what landed in DuckDB: rows per raw table, loader positions vs Kafka, last batches
+	@PYTHONPATH=orchestration/include $(UV) run python scripts/peek_warehouse.py
+
+# harlequin gets a read-only connection, but DuckDB still refuses it while a DAG
+# task holds the write lock. If it does, try again a few seconds later.
+sql: ## explore the warehouse in harlequin (a terminal SQL IDE), read-only
+	$(UV) run harlequin --read-only data/warehouse/bikeshare.duckdb

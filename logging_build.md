@@ -12,8 +12,8 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 1a | Environment: uv workspace, `.env.example`, Makefile skeleton | ✅ done | 2026-09-15 | `9c0606a` |
 | 1b | Source: sim clock, world, engine, faults, FastAPI and SSE, tests, Dockerfile, compose | ✅ done | 2026-09-15 | `efee5aa` |
 | 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ✅ done | 2026-09-15 | `04dede1` |
-| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ⏸ waiting for your review | 2026-09-16 | "Layer 3" commit |
-| 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ⬜ todo | | |
+| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done | 2026-09-16 | `87929c4` |
+| 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ⏸ waiting for your review | 2026-09-16 | "Layer 4" commit |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⬜ todo | | |
 | 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⬜ todo | | |
 
@@ -200,6 +200,47 @@ Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 
   - **Orphan false positives:** 16 had their partner dead-lettered (schema drift). 16 could not be checked (the partner had left the source buffer).
 
+### Layer 4: Airflow and the DuckDB landing zone (2026-09-16)
+
+**Read first, in this order:**
+
+1. `orchestration/include/landing/kafka_loader.py`: the exactly-once argument is in its docstring.
+2. `orchestration/dags/stream_landing.py`: how a DAG wires connections, variable, pool and asset.
+3. The `x-airflow-common` block in `docker-compose.yml`: Airflow 3's pieces and their configuration.
+4. `landing/warehouse.py`: the single-writer rule and the `raw` schema.
+
+| File | Purpose |
+|---|---|
+| `orchestration/include/landing/warehouse.py` | `connect()` retries on the DuckDB write lock and sets the session TimeZone to UTC. `ensure_raw_schema()` is idempotent DDL: `raw.trip_events`, `station_status`, `dlq` and `alerts` (identical shape, PK topic/partition/offset, value kept as JSON text); `_kafka_offsets`; `_ingest_batches` (audit); typed `stations`, `bikes`, `weather`, `fault_log`. |
+| `…/landing/kafka_loader.py` | `plan_slices` (start = offset stored in DuckDB, end = end-offset snapshot, retention-gap note), `read_slices` (time budget), `land_topic` (one transaction for rows, offsets and audit, then a Kafka commit as consumer group `duckdb-loader`, purely for the lag view). |
+| `…/landing/api_extract.py` | stations and bikes: snapshot, replaced. weather: incremental by time. fault_log: incremental by id, paged. Each extract is one idempotent transaction with an audit row. |
+| `orchestration/dags/stream_landing.py` | Every 5 min: `prepare_warehouse` → `land_<table>` × 4 (pool `duckdb`) → `report` (outlet Asset `raw_stream` carrying row counts; skipped when nothing landed, so no asset event). |
+| `orchestration/dags/api_extract.py` | Every 15 min: `prepare_warehouse` → stations, bikes, weather, fault_log → `report` (Asset `raw_api`). |
+| `orchestration/Dockerfile` | `apache/airflow:3.3.1-python3.12`, plus confluent-kafka 2.15.1 and duckdb 1.5.5 installed with Airflow pinned, plus `/opt/dbt-venv` (dbt-core 1.12.5, dbt-duckdb 1.11.0) for layer 5. |
+| `orchestration/tests/` | 12 tests on a real DuckDB file: first run, incremental run, bounded snapshot, **a failed write rolls back rows and position together and never commits to Kafka**, expired offsets, per-run cap, idempotent extracts, weather cursor, fault-log paging, and the lock wait across processes (subprocess holder). |
+| `docker-compose.yml` | Profile `batch`: `airflow-db` (postgres:16-alpine, no host port), `airflow-init` (migrate + pool), `airflow-apiserver` (:8080), `airflow-scheduler`, `airflow-dag-processor`. Shared `x-airflow-common`: LocalExecutor, Execution API URL, JWT secret, SimpleAuthManager with all users admin, connections and variable from env, `PYTHONPATH=/opt/airflow/include`, mounts (dags, include, warehouse, lake:ro, logs volume), recovery timings. |
+| `Makefile` | Adds `dags`, `runs`, `trigger` (the Airflow CLI through `/entrypoint`), `warehouse` and `sql` (harlequin, read-only). `COMPOSE_PROFILES ?= stream,batch`. `reset` also wipes `data/warehouse`. |
+| `scripts/peek_warehouse.py` | Rows per raw table, stored positions vs Kafka end offsets, latest batches, a first JSON query. |
+| `.env.example` | `COMPOSE_PROFILES=stream,batch`, `AIRFLOW_PORT`, `AIRFLOW_JWT_SECRET`. |
+
+**How to poke at it:**
+
+- `make up`, then `make dags`, `make runs` and `make warehouse`
+- http://localhost:8080: DAG graph, task logs, Assets and pool views
+- the Console → consumer group `duckdb-loader` → lag
+- `make sql`, then `SELECT value->>'$.event_type', count(*) FROM raw.trip_events GROUP BY 1`
+
+**Verified:**
+
+- **Bring-up:** 11 services; `airflow-init` Exited (0) with "Pool duckdb created".
+- **DAGs:** both parsed with no import errors, started unpaused, first runs succeeded (stream_landing ~22 s, api_extract ~12 s).
+- **First landing:** 32,083 trip events, 75,785 status, 149 dead letters and 928 alerts, plus 40 stations, 600 bikes, 158 weather hours and 1,173 fault-log rows.
+- **Invariant, rows = distinct (partition, offset) = sum of stored positions**, held for all 4 tables after every run.
+- **Kafka's committed offsets for `duckdb-loader`** equal the positions stored in DuckDB, so the Console's lag is correct.
+- **Asset events** `raw_stream` and `raw_api` were recorded, with row counts in `extra` (REST API).
+- **Crash tests:** `SIGKILL` of the scheduler while a `land_*` task was running, 3 times. The killed attempt left nothing (its transaction never committed), the retry landed the slice once, and the invariant held each time. Recovery took 5 min 01 s and 5 min 24 s with the defaults, then 87 s after setting `orphaned_tasks_check_interval=60` (see decisions).
+- **Resources:** Airflow ~1.1 GB (scheduler 570 MB, API server 270 MB, DAG processor 190 MB, Postgres 45 MB). The whole stack ~3.8 GB.
+
 ## Decisions and deviations from the plan
 
 | Date | Decision | Why |
@@ -229,6 +270,15 @@ Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 | 2026-09-16 | `pyspark==4.2.0` is in the default dependency groups. The plan said opt-in. | Spark is a core component. The rules are unit-tested locally, and the version is pinned to match the image. |
 | 2026-09-15 | Spark is in compose profile `stream`. The Makefile defaults `COMPOSE_PROFILES=stream`. `down` and `reset` use `--profile '*'`. | Lets you run the core without Spark when RAM is tight. Stopping always covers every profile. |
 | 2026-09-15 | `spark-reset` also deletes the alerts topic. | Resetting a job's progress without its outputs duplicates its results on replay. |
+| 2026-09-16 | The landing code is a plain package, `orchestration/include/landing/`, with no Airflow import. DAGs only schedule it. The plan said `include/kafka_to_duckdb.py` + `duckdb_io.py`. | Unit-testable without Airflow (not installed locally). It is the same package the peek script uses. |
+| 2026-09-16 | Raw topic tables keep `value` and `headers` as JSON **text** (VARCHAR), not the JSON type. | A malformed message can never block landing. dbt parses the text. |
+| 2026-09-16 | stations and bikes are replaced on every extract (current snapshot). weather and fault_log are append-only incremental. | History of reference data belongs in dbt snapshots (layer 5). Incremental loads rely on primary keys + `ON CONFLICT DO NOTHING`, so they are idempotent. |
+| 2026-09-16 | Warehouse connections set `TimeZone = 'UTC'`. | DuckDB returned TIMESTAMPTZ in the host's local zone (+01:00 on this machine). A test on the weather cursor caught it. |
+| 2026-09-16 | `report` raises `AirflowSkipException` when nothing landed. | A skipped task emits no asset event, so dbt (layer 5) won't run for nothing. |
+| 2026-09-16 | Airflow commands run through the image's `/entrypoint`: `airflow-init`'s command is `bash -c …`, and the Makefile uses `exec … /entrypoint airflow`. | As an arbitrary UID, only the entrypoint puts Airflow's user site-packages on PYTHONPATH. Without it: "No module named airflow" (seen). |
+| 2026-09-16 | No triggerer service. The official compose has one. | No deferrable operators here. Saves ~200 MB. |
+| 2026-09-16 | `orphaned_tasks_check_interval=60` and `task_instance_heartbeat_timeout=90` (defaults 300 / 300). | Measured: after a scheduler crash, the dead task held the only `duckdb` pool slot for 5 min. The first fix tried (heartbeat timeout alone) did not help, because the orphan check is what recovers a dead scheduler's tasks. Recovery is now 87 s. |
+| 2026-09-16 | Your `.env` was regenerated from `.env.example`. | It was identical to the layer 3 template, and `COMPOSE_PROFILES=stream` kept Airflow from starting. |
 
 ## Pinned versions
 
@@ -246,6 +296,10 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 | pyspark (`spark` group, default) | 4.2.0 (= the image) | `pyproject.toml`, `uv.lock` |
 | Spark image | `spark:4.2.0-scala2.13-java21-python3-ubuntu` (Docker Official Image; JDK 21.0.12, Python 3.10.12) | `streaming/Dockerfile` |
 | Spark Kafka connector | `spark-sql-kafka-0-10_2.13:4.2.0` → kafka-clients 3.9.2, commons-pool2 2.13.1 | `streaming/Dockerfile` |
+| Airflow | `apache/airflow:3.3.1-python3.12` (Python 3.12.13, pyarrow 25.0.0, httpx 0.28.1) | `orchestration/Dockerfile` |
+| Airflow extras | confluent-kafka 2.15.1, duckdb 1.5.5; `/opt/dbt-venv`: dbt-core 1.12.5, dbt-duckdb 1.11.0 | `orchestration/Dockerfile` |
+| Airflow metadata DB | `postgres:16-alpine` | `docker-compose.yml` |
+| duckdb (host) | 1.5.5, now pinned `==` (was `>=1.4`); pyarrow ≥ 25 added to `warehouse` | `pyproject.toml` |
 | pytest / ruff | 9.1.1 / 0.16.7 | `uv.lock` |
 | Base image (source, bridge) | `python:3.12-slim` + `ghcr.io/astral-sh/uv:0.12.9` | `source/Dockerfile`, `ingest/Dockerfile` |
 | Kafka | `apache/kafka:4.3.1` (KRaft, JDK 21), cluster id `MoQ1R7PRSkaSfyAV5NC-sg` | `docker-compose.yml` |
@@ -258,6 +312,7 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **Host UID:GID** is 1001:1001, used for container bind mounts.
 - Kafka, Spark, Airflow, dbt and duckdb are not installed on the host. They come from Docker images or the uv venv.
 - The planned host ports (8000, 8080, 8081, 4040, 9092, 9094) were free. Airflow's metadata Postgres will not publish a host port.
+- **2026-09-16, disk:** 5.5 GB free (93% used) after the Airflow image (3.2 GB base). Docker images total ~7.4 GB, many layers shared; build cache 2.1 GB, ~0.7 GB of it reclaimable (`docker builder prune`).
 
 ## Known issues / TODO
 
@@ -275,9 +330,14 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **PySpark pitfall:** `collect()` returns naive datetimes in the Python process's local timezone (seen in the tests on this Paris-time host). The container runs in UTC.
 - **Spark's Parquet sink records its commits in `_spark_metadata/`.** DuckDB's glob ignores that log, so a crashed batch's uncommitted file could be counted. That is acceptable here.
 - **Changing `spark.sql.shuffle.partitions` or any stateful query's shape** requires `make spark-reset`. The checkpoints remember both.
-- **Next (layer 4):**
-  - Airflow 3.x (LocalExecutor, Postgres metadata DB, SimpleAuthManager) in compose profile `batch`;
-  - an image with confluent-kafka, duckdb 1.5.5 (same as the host) and pyarrow, plus dbt-duckdb in its own venv;
-  - `stream_landing` DAG: bounded Kafka → DuckDB `raw.*` batches, with offsets kept in DuckDB in the same transaction, and `raw._ingest_batches` audit rows;
-  - `api_extract` DAG: stations, bikes, weather and fault-log → `raw.*`;
-  - pool `duckdb` (1 slot), Assets, connections set from env.
+- **Airflow: reading the warehouse from the host can be refused while a DAG writes.** DuckDB has one writer, and a landing task holds the lock for a few seconds. `make warehouse` waits (retry). harlequin (`make sql`) refuses to start: retry a few seconds later. Layer 5's serving copy removes this.
+- **The warehouse file is `ai-user:root`** (Airflow runs as your UID with group 0, the official pattern). You own it and can delete it.
+- **Airflow CLI calls take a few seconds each** (`make dags`, `runs`, `trigger`): each one starts a Python process through the entrypoint. For tight polling, use the REST API (`curl localhost:8080/api/v2/...`), which needs no login locally.
+- **`stream_landing` lands at most 200k messages per partition per run** (`max_per_partition`) and reads for at most 120 s. After a huge fast-forward, it catches up over several runs (the notes in `raw._ingest_batches.detail` say so).
+- **Next (layer 5):**
+  - dbt project `transform/` (dbt-duckdb, profile path from env), with sources `raw.*` (freshness on `loaded_at`) and `lake.station_metrics` (Parquet);
+  - staging (typed JSON extraction, dedup on event_id), snapshot `snap_stations` (SCD2);
+  - intermediate: trips pairing, status gaps, flatlines (the exact frozen check);
+  - marts: `fct_trips`, `mart_station_usage_hourly`, `mart_data_quality_daily`, `mart_detection_scorecard` (Spark alerts + dbt checks vs ground truth, with secondary-effect attribution), `mart_pipeline_health`;
+  - tests (generic, singular, unit, one contract);
+  - DAG `dbt_transform` on the `raw_stream` / `raw_api` assets, then `publish_serving_copy`.

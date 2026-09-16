@@ -50,10 +50,12 @@ dev = [
 ]
 # Looking at and transforming the warehouse from the host: DuckDB, the dbt
 # adapter, and harlequin (a terminal SQL IDE).
-# NOTE: keep `duckdb` on the same version as the Airflow image (layer 4).
-# DuckDB's on-disk format must match between the writer and the readers.
+# duckdb is pinned to the Airflow image's version (orchestration/Dockerfile): the
+# DuckDB file is written in Airflow and read here, so both sides must share a format.
+# pyarrow: bulk inserts into DuckDB (orchestration/include/landing).
 warehouse = [
-    "duckdb>=1.4,<2",
+    "duckdb==1.5.5",
+    "pyarrow>=25",
     "dbt-duckdb>=1.10",
     "harlequin>=2",
 ]
@@ -65,13 +67,14 @@ spark = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["source/tests", "ingest/tests", "streaming/tests"]
+testpaths = ["source/tests", "ingest/tests", "streaming/tests", "orchestration/tests"]
 # importlib mode: both members can have tests/test_*.py with the same file
 # names without clashing. Shared test helpers are therefore plain modules with
 # unique names (source/tests/simkit.py, ingest/tests/bridgekit.py), put on the path here.
 addopts = "--import-mode=importlib"
-# "streaming" makes the Spark job's `analyzer` package importable by its tests.
-pythonpath = ["source/tests", "ingest/tests", "streaming"]
+# "streaming" and "orchestration/include" make the Spark job's `analyzer` package and
+# the DAGs' `landing` package importable by their tests.
+pythonpath = ["source/tests", "ingest/tests", "streaming", "orchestration/include"]
 filterwarnings = [
     # Third-party deprecations raised inside starlette's TestClient, not in our code.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
@@ -84,7 +87,7 @@ target-version = "py312"
 
 [tool.ruff.lint.isort]
 # Import blocks: stdlib / third-party / our packages / test helpers.
-known-first-party = ["bikeshare_sim", "bikeshare_bridge", "analyzer"]
+known-first-party = ["bikeshare_sim", "bikeshare_bridge", "analyzer", "landing"]
 known-local-folder = ["simkit", "bridgekit"]
 
 # For editors (Pyright / Pylance): analyse with the project's .venv, where the
