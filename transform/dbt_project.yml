@@ -7,6 +7,8 @@
 #     (this folder, mounted).
 #   - You, on the host: `make dbt c="build -s staging"` (same dbt version, from the uv venv).
 # Where it writes: the DuckDB warehouse (see profiles.yml), one schema per layer.
+# Artifacts and logs: target/ and logs/ for Airflow; target-host/, target-docs/ and
+# logs-host/ for dbt on the host (set by the Makefile), so the two never mix.
 #
 # Layers, one folder and one schema each:
 #   staging       one view per raw table: JSON → typed columns, duplicates removed.
@@ -25,7 +27,7 @@ snapshot-paths: ["snapshots"]
 seed-paths: ["seeds"]
 test-paths: ["tests"]
 macro-paths: ["macros"]
-clean-targets: ["target", "dbt_packages"]
+clean-targets: ["target", "target-host", "target-docs", "dbt_packages"]
 
 vars:
   # (Spark's Parquet folder is not a var: it comes from env LAKE_DIR, read in

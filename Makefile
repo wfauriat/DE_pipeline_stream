@@ -223,16 +223,24 @@ sql: ## explore the marts in harlequin (a terminal SQL IDE), on the serving copy
 	$(UV) run harlequin --read-only data/warehouse/bikeshare_serving.duckdb
 
 ##@ dbt and the serving copy
-# dbt on the host, from transform/: the same dbt version as in Airflow, and the
-# same live warehouse. It needs the write lock, so it fails if a DAG task is
-# writing at that moment. Run it again, or pause the DAGs in the UI while you iterate.
-DBT := DBT_PROFILES_DIR=. DBT_SEND_ANONYMOUS_USAGE_STATS=false $(UV) run dbt
+# dbt on the host, from transform/: the same dbt version as in Airflow.
+# Its artifacts and logs never go to target/ and logs/, which belong to Airflow's
+# dbt: quality_report reads target/run_results.json right after the build, and
+# two dbt processes sharing a folder overwrite each other's results and parse cache.
+DBT := DBT_PROFILES_DIR=. DBT_SEND_ANONYMOUS_USAGE_STATS=false DBT_LOG_PATH=logs-host $(UV) run dbt
 
+# `make dbt` works on the live warehouse. It needs the write lock, so it fails if a
+# DAG task is writing at that moment. Run it again, or pause the DAGs in the UI while you iterate.
 dbt: ## run dbt on the host: make dbt c="build -s staging"  (default: build)
-	cd transform && $(DBT) $(or $(c),build)
+	cd transform && DBT_TARGET_PATH=target-host $(DBT) $(or $(c),build)
 
+# The docs never open the live warehouse: the catalog is read from a copy of its
+# structure (no rows), taken in well under a second while no task writes.
+DOCS_DIR := target-docs
 dbt-docs: ## dbt docs with the lineage graph, raw → marts: http://localhost:8082
-	cd transform && $(DBT) docs generate && $(DBT) docs serve --port 8082 --no-browser
+	@PYTHONPATH=orchestration/include $(UV) run python scripts/copy_warehouse_schema.py transform/$(DOCS_DIR)/bikeshare.duckdb
+	cd transform && DBT_TARGET_PATH=$(DOCS_DIR) DUCKDB_PATH=$(DOCS_DIR)/bikeshare.duckdb $(DBT) docs generate
+	cd transform && DBT_TARGET_PATH=$(DOCS_DIR) $(DBT) docs serve --port 8082 --no-browser
 
 # These read the serving copy, which Airflow republishes after every dbt build.
 scorecard: ## precision and recall of every detector, against the ground truth

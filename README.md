@@ -174,7 +174,7 @@ make quality        # data quality per simulated day
 make serving        # what the serving copy holds, and when it was published
 make sql            # harlequin on the serving copy
 make dbt c="build -s staging"   # dbt on the host (same version; mind the warehouse lock)
-make dbt-docs       # lineage graph raw → marts: http://localhost:8082
+make dbt-docs       # lineage graph raw → marts: http://localhost:8082 (built from a structure-only copy)
 ```
 
 What dbt shows here, beyond models:

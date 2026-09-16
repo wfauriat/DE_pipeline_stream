@@ -15,7 +15,7 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ✅ done (review deferred) | 2026-09-16 | `9611496` |
-| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏳ in progress: `TOUR.md` done; smoke script and dashboard remain | 2026-09-16 | "Guided tour" commit |
+| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏳ in progress: `TOUR.md` done, `make dbt-docs` lock fix; smoke script and dashboard remain | 2026-09-16 | `b91c03e` (tour) |
 
 Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 
@@ -377,6 +377,8 @@ Things to know:
 | 2026-09-16 | `duckdb__snapshot_get_time` overridden to TIMESTAMPTZ. | dbt-duckdb's naive TIMESTAMP clock warned against the TIMESTAMPTZ `updated_at`. |
 | 2026-09-16 | dbt pinned to the Airflow image's versions (`dbt-core==1.12.5`, `dbt-duckdb==1.11.0`) in the `warehouse` group. | The same dbt on the host and in Airflow, over the same file. |
 | 2026-09-16 | The end-to-end check ran after `make reset`. | The source fix only applies to new data, and it proves the whole pipeline starts from zero. |
+| 2026-09-16 | **`make dbt-docs` builds the catalog from a structure-only copy** of the warehouse (`scripts/copy_warehouse_schema.py`: read-only open that waits for the lock, `COPY FROM DATABASE … (SCHEMA)`, into `transform/target-docs/bikeshare.duckdb`). | You saw `make dbt-docs` fail: `dbt.log` showed `Could not set lock … held in python3.12`, Airflow's `dbt build` (~23 s at 600×, every 2.5–5 min). The catalog needs no rows; the copy takes ~0.2 s and waits for the lock (tested with a 6 s holder). The file must be named `bikeshare.duckdb`: dbt-duckdb names the database after the file, and the docs showed `"docs_catalog"."marts"…` otherwise. |
+| 2026-09-16 | dbt on the host writes `transform/target-host/`, `target-docs/` and `logs-host/` (`DBT_TARGET_PATH`, `DBT_LOG_PATH` in the Makefile). `target/` and `logs/` are Airflow's. | Both runners shared one folder: the log showed their lines interleaved; a host run writes `target/run_results.json` (checked: `docs generate` writes one), which `quality_report` reads right after `dbt_build`; and they overwrote each other's parse cache, built with different env (`DUCKDB_PATH`, `LAKE_DIR`). |
 
 ## Pinned versions
 
@@ -433,14 +435,15 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **The warehouse file is `ai-user:root`** (Airflow runs as your UID with group 0, the official pattern). You own it and can delete it.
 - **Airflow CLI calls take a few seconds each** (`make dags`, `runs`, `trigger`): each one starts a Python process through the entrypoint. For tight polling, use the REST API (`curl localhost:8080/api/v2/...`), which needs no login locally.
 - **`stream_landing` lands at most 200k messages per partition per run** (`max_per_partition`) and reads for at most 120 s. After a huge fast-forward, it catches up over several runs (the notes in `raw._ingest_batches.detail` say so).
-- **dbt on the host (`make dbt`) needs the warehouse write lock.** It fails if a DAG task writes at that moment. Retry, or pause the DAGs while you iterate. For free exploration, copy the warehouse as in layer 5's development (`ATTACH … (READ_ONLY)` + `COPY FROM DATABASE`).
+- **dbt on the host (`make dbt`) needs the warehouse write lock.** It fails if a DAG task writes at that moment (dbt-duckdb does not retry). Retry, or pause the DAGs while you iterate. For free exploration, copy the warehouse as in layer 5's development (`ATTACH … (READ_ONLY)` + `COPY FROM DATABASE`). `make dbt-docs` no longer needs the lock (see decisions).
+- **The reverse also holds:** while the host holds the lock, a dbt task in Airflow fails (retried after 30 s). The docs' structure copy holds a read-only lock for well under a second, so this is rare; a long `make dbt` makes it likely.
 - **At high simulation speed, the fault log lags** (extracted every 15 real minutes = 6 simulated days at 600×), so the scorecard judges an older horizon. `make trigger d=api_extract` refreshes it, and the asset event then rebuilds the marts.
 - **`stale_snapshot` still has unexplained false positives** (~29% of detections in the fresh run). Likely causes: dead-lettered or dropped trip events at the station, and silent rebalancing coinciding with trips. Candidate attributions to add.
 - **Spark's `frozen_station` found 0 of 3 frozen episodes in the fresh run** (short episodes). dbt's exact check found 3 of 3. That contrast is the point of having both.
 - **dbt rebuilds everything except `fct_trips` on each run** (views and tables). About 4–15 s at this volume. Incremental marts would be the next step at scale.
 - **The stack was left running at 600× speed** (set during layer 5's end-to-end check). `make speed x=60` restores the normal pace, as `TOUR.md` §1 says.
 - **Layer 6 so far:** `TOUR.md` is written (2026-09-16, at the end of a long session, from the full build context). It covers: the whole picture, start-up, the three clocks, a wiring map (services, topics, consumer positions, delivery guarantees, "change X → edit Y"), a stop-by-stop tour, 10 experiments with expected outcomes, how to read the scorecard, where state lives, and what is missing.
-  - **Not yet re-verified command by command:** a new session should walk the tour once and fix any drift.
+  - **Not yet re-verified command by command.** You ran a quick pass over the commands (2026-09-16): they worked except `make dbt-docs` (lock, now fixed). The §1 service count was also corrected (11 services including the 2 one-shots). The 10 experiments are still unchecked.
 - **Next (rest of layer 6):**
   - `scripts/smoke.py` (`make smoke`): an end-to-end check from an empty stack (source healthy → topics filling → Spark alerts → landing → dbt → serving copy → scorecard rows);
   - optional Streamlit dashboard on the serving copy.

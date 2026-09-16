@@ -59,7 +59,7 @@ Companion documents:
 
 ```bash
 make setup        # .venv (uv), .env with your UID/GID, data/ folders
-make up           # builds images, starts 11 services (+2 one-shots that exit 0)
+make up           # builds images, starts 11 services (2 are one-shots that exit 0)
 make ps           # health; kafka-init and airflow-init should read "Exited (0)"
 make speed x=60   # normal pace: 1 simulated hour per real minute
 ```
@@ -277,6 +277,14 @@ make sql             # harlequin on the serving copy: marts only, never locked
 make serving         # when the copy was published, rows per table
 ```
 
+`make dbt-docs` never opens the live warehouse for writing. Its catalog only needs tables, views and columns, so the target:
+
+1. copies the warehouse's structure, with no rows, into `transform/target-docs/bikeshare.duckdb`. The copy opens the warehouse read-only for a split second, and waits if a task holds the lock;
+2. generates the docs from that copy;
+3. serves them.
+
+Run on the live file, `dbt docs generate` would hold DuckDB's single lock for several seconds. It failed whenever a landing or a dbt build held it, about a minute out of every five.
+
 **Read, in order:**
 
 1. `transform/dbt_project.yml`, `profiles.yml` and `models/sources.yml`
@@ -295,7 +303,8 @@ make serving         # when the copy was published, rows per table
 - **A unit test and an enforced contract.**
 - **An external source over Spark's Parquet**, with an empty-lake guard.
 - **Freshness on wall-clock landing time.**
-- **An atomic serving copy for readers.**
+- **Readers never take the writer's lock.** Data comes from an atomic serving copy, and the docs from a copy of the structure.
+- **One dbt project, two runners, separate artifacts.** Airflow's dbt writes `transform/target/` (its `quality_report` reads `run_results.json` from there). dbt on the host writes `target-host/` or `target-docs/`.
 
 ---
 
@@ -361,6 +370,10 @@ data/
   lake/station_metrics/date=…/     Spark's Parquet windows                       (spark → dbt)
   warehouse/bikeshare.duckdb       raw, staging, intermediate, snapshots, marts, audit   (Airflow + dbt)
   warehouse/bikeshare_serving.duckdb   marts only, for readers                   (publish_serving)
+transform/
+  target/, logs/                   dbt artifacts and logs                        (Airflow's dbt)
+  target-host/, logs-host/         the same, for `make dbt`                      (you)
+  target-docs/                     docs + bikeshare.duckdb, a structure-only copy (`make dbt-docs`)
 docker volumes: kafka-data, airflow-db, airflow-logs
 ```
 
