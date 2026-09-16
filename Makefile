@@ -43,7 +43,7 @@ JSON     := -H 'content-type: application/json'
         source-run source-reset clock speed pause resume ff stream stats \
         faults fault fault-rate fault-on fault-off fault-log \
         topics tail dlq bridge-run bridge-reset alerts lake spark-reset \
-        dags runs trigger warehouse sql dbt dbt-docs scorecard quality serving
+        dags runs trigger warehouse sql dbt dbt-docs scorecard quality serving dashboard
 
 help: ## list targets
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -261,3 +261,8 @@ quality: ## data quality per simulated day
 
 serving: ## what the serving copy holds, and when it was published
 	@$(UV) run python scripts/peek_serving.py published
+
+# Streamlit on the host. It reads the serving copy only, and follows each new publish.
+dashboard: ## Streamlit dashboard on the serving copy: http://localhost:8501 (Ctrl-C stops it)
+	$(UV) run streamlit run dashboard/app.py --server.port $(or $(DASHBOARD_PORT),8501) \
+	  --server.address localhost --server.headless true --browser.gatherUsageStats false

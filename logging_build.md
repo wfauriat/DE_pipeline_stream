@@ -15,7 +15,7 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ✅ done (review deferred) | 2026-09-16 | `9611496` |
-| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏸ waiting for your review: `TOUR.md` checked by running its 10 experiments, `make smoke`, fixes for `make dbt-docs` and `make spark-reset`. The Streamlit dashboard is optional: your call | 2026-09-16 | `b91c03e` (tour), `cefc82d` (dbt-docs), then the spark-reset + smoke commit |
+| 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⏸ waiting for your review: `TOUR.md` checked by running its 10 experiments, `make smoke`, the Streamlit dashboard, fixes for `make dbt-docs` and `make spark-reset` | 2026-09-16 → 17 | `b91c03e` (tour), `cefc82d` (dbt-docs), `9a3831e` (spark-reset + smoke), then the dashboard commit |
 
 Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 
@@ -364,6 +364,32 @@ Things to know:
 - Third run, with the final code (readiness waits added): passed in 1 min 43 s.
 - Not run from an empty stack (`make reset && make up && make smoke`): that wipes the world. It waits up to 60 s for the source and 180 s for the DAGs to parse, for that case.
 
+### Layer 6: the Streamlit dashboard (2026-09-17)
+
+**Read first:** `TOUR.md` stop 6, then `dashboard/app.py` (docstring, `load`, `follow_new_copies`, one tab).
+
+| Path | Purpose |
+|---|---|
+| `dashboard/app.py` | Four tabs on the serving copy only. **Detection:** recall per fault type × detector; for each check, the share of its detections that are true / explained / unexplained. **Data quality:** events per simulated day; source duplicates, late events, dead letters per day. **City:** trips per hour of day (member vs casual); station map, size = docks, color = share of time empty or full. **Pipeline:** rows landed and bridge→DuckDB latency per UTC hour; days where Spark and batch differ. KPI tiles per tab, a table view under each, one simulated-days slider scoping *Data quality* and *City*. |
+| `dashboard/tests/test_app.py` | 3 tests with Streamlit's `AppTest` (headless, in-process) on a serving copy built in the test: every tab renders with the right KPI values; a copy swapped with `os.replace` is read on the next run (the cache follows the file's mtime); without a copy, the page says how to get one. |
+| `pyproject.toml`, `uv.lock` | New default group `dashboard`: `streamlit>=1.50` (1.64.0, with altair 6.3.0), `pandas>=2.2,<3` (2.3.3). `dashboard/tests` added to `testpaths`. |
+| `Makefile` | `dashboard`: `streamlit run` on localhost:8501 (`DASHBOARD_PORT` overrides). |
+| `TOUR.md`, `README.md` | Stop 6, the address table, the whole-picture diagram; the item removed from "not here yet". |
+
+**Verified:**
+
+- `AppTest` on the live serving copy (~386k events): no exception, 17 KPI tiles, 6 tables; the numbers match the marts (4,001 faults judged, 99.8% found by at least one check).
+- **Every chart rendered and looked at:** each Altair chart was captured during a headless run and rendered to PNG with `vl-convert` (installed only for that run: `uv run --with`, not in the lock). That review found and fixed three problems:
+  - the pipeline hours showed in the viewer's time zone (Paris: +2 h): axes and tooltips now use a UTC scale;
+  - low-share stations were near-invisible (ramp step 100 on white): the light ramp now starts at step 250, and the docks legend showed "0": now 20 / 35 / 50;
+  - the Spark vs batch chart was one bar among 23 zeros: now a table of the days that differ, next to the KPI.
+- The first `AppTest` run caught a crash (`melt` into a column name that already existed).
+- `make dashboard` serves: `/_stcore/health` → `ok`, page 200, listening on 127.0.0.1 only.
+- `make test`: 78 passed, no warning (before the pandas pin, pyspark warned about pandas 3); `make lint` clean.
+- Palette: the dataviz validator passed on slots 1–3 in light and dark, all pairs (worst CVD ΔE 9.2 light, 9.4 dark). One WARN: aqua is 2.74:1 on the light surface, covered by the legends and table views.
+
+**Not verified:** the charts inside Streamlit's own frontend (no browser on this host; `vl-convert` uses the same Vega renderer, without Streamlit's theme), dark mode visually, the crosshair hover, and the 30 s auto-reload in a live browser (its cache-per-version logic is tested; the timer is Streamlit's).
+
 ## Decisions and deviations from the plan
 
 | Date | Decision | Why |
@@ -418,6 +444,10 @@ Things to know:
 | 2026-09-16 | `make smoke` checks the RUNNING stack and never starts, stops or resets anything. From scratch: `make reset && make up && make smoke`. | A target that resets on its own would wipe your world by accident. The side effects it has are the ones any user of the stack has: two forced faults (recorded in the ground truth, so the scorecard stays honest) and two DAG runs outside their schedule. |
 | 2026-09-16 | Smoke checks the injected faults row by row (raw tables, `fct_trips`), not through the scorecard's precision and recall. PLAN §13 said "the scorecard shows the injected fault as detected". | The scorecard judges only faults older than 4 simulated hours (and needs the fault log extracted), which would add minutes to every run. The row checks follow the same keys the scorecard matches on. |
 | 2026-09-16 | Smoke triggers DAGs through Airflow's REST API (`POST /api/v2/dags/{id}/dagRuns`, `logical_date: null`). | No login needed locally (checked: a probe on an unknown DAG returned 404, not 401), and it returns the run id to follow, unlike the CLI's table output. |
+| 2026-09-17 | The dashboard reads the serving copy only, runs on the host (`make dashboard`), and binds to localhost. | The same rule as every reader since layer 5: never the warehouse's lock. Streamlit binds every interface by default (its log printed an "External URL"); a local tool doesn't need that. No compose service: it would add an image for a reader that `uv run` starts in seconds. |
+| 2026-09-17 | Data cached per version of the serving copy (`st.cache_data` keyed on its mtime), plus a 30 s `st.fragment` that reruns the page when the mtime changes. | Reloads cost nothing until Airflow publishes, and the page follows each publish without a manual refresh. `os.replace` guarantees a whole file per version. |
+| 2026-09-17 | `dashboard` is a DEFAULT dependency group, in the shared `uv.lock`. `pandas` pinned `<3`. | `make setup` installs it and `make test` runs its tests. Costs: the lock change rebuilds the source and bridge images at the next `make up` (their Dockerfiles copy `uv.lock`), `websockets` moved 17.1 → 16.1.1 (uvicorn[standard] in the source, for WebSockets it never serves; the source and ingest tests pass), and Streamlit brought pandas into the environment, as 3.0.5, which pyspark 4.2 warned it does not fully support: hence the pin (2.3.3). |
+| 2026-09-17 | Chart design by the dataviz method: form first, then color by job; categorical slots 1–3 (bridge, spark, dbt in pipeline order, fixed across charts), one blue ramp; 2 px lines, ≤ 24 px bars rounded at the data end, 2 px surface gaps and rings; tooltips everywhere; a table view per tab; UTC scale for wall-clock instants. | Readable in both themes and for color-vision deficiencies, checked by the validator rather than by eye. A series that is almost all zeros is a table, not a chart. |
 | 2026-09-16 | No topic-identity guard in the loader (yet). | Kafka's topic id (`AdminClient.describe_topics`) would let the loader refuse positions from another incarnation of a topic. `make spark-reset` is the only path that deletes a topic, and it now resets the positions; the guard would also cover a topic deleted by hand. Left as a known issue. |
 | 2026-09-16 | dbt on the host writes `transform/target-host/`, `target-docs/` and `logs-host/` (`DBT_TARGET_PATH`, `DBT_LOG_PATH` in the Makefile). `target/` and `logs/` are Airflow's. | Both runners shared one folder: the log showed their lines interleaved; a host run writes `target/run_results.json` (checked: `docs generate` writes one), which `quality_report` reads right after `dbt_build`; and they overwrote each other's parse cache, built with different env (`DUCKDB_PATH`, `LAKE_DIR`). |
 
@@ -446,6 +476,7 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 | Base image (source, bridge) | `python:3.12-slim` + `ghcr.io/astral-sh/uv:0.12.9` | `source/Dockerfile`, `ingest/Dockerfile` |
 | Kafka | `apache/kafka:4.3.1` (KRaft, JDK 21), cluster id `MoQ1R7PRSkaSfyAV5NC-sg` | `docker-compose.yml` |
 | Redpanda Console | `redpandadata/console:v3.11.0` | `docker-compose.yml` |
+| streamlit / altair / pandas (`dashboard` group) | 1.64.0 / 6.3.0 / 2.3.3 (`pandas>=2.2,<3`) | `pyproject.toml`, `uv.lock` |
 
 ## Host environment (checked 2026-09-15)
 
@@ -491,4 +522,6 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
   - **Verified (2026-09-16).** You ran a quick pass over the commands: they worked except `make dbt-docs` (lock, fixed in `cefc82d`). The §1 service count was corrected (11 services including the 2 one-shots). All 10 experiments were then run (results in "Layer 6" above). The drifts found were fixed in `TOUR.md` (the expectations of experiments 5 and 10, the `dbt_transform` duration, measured values added), and experiment 9 found the `spark-reset` alerts bug (fixed).
 - **`make smoke` was verified on a running stack only**, not right after `make reset && make up` (see "Layer 6").
 - **Each `make smoke` adds two faults to the world** (a teleport and a schema drift). They are real faults for the scorecard: their detections count as true ones.
-- **Next:** your review of layer 6. Optional: a Streamlit dashboard on the serving copy.
+- **The next `make up` rebuilds the source and bridge images** (and so restarts them, which resets runtime controls such as `make speed`): `uv.lock` changed with the dashboard group.
+- **The dashboard was not seen in a real browser** (none on this host): charts were checked as PNGs rendered by Vega's own renderer. Dark mode, the hover crosshair and the live auto-reload remain to be looked at.
+- **Next:** your review of layer 6 (tour, experiments, smoke, dashboard). That completes the plan.

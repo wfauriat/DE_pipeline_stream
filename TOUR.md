@@ -40,7 +40,7 @@ Companion documents:
                                                       (+ Spark's lake read in place)
                                            │
                                            ▼
-                     data/warehouse/bikeshare_serving.duckdb  ←  you (make sql / scorecard / quality)
+                     data/warehouse/bikeshare_serving.duckdb  ←  you (make dashboard / sql / scorecard)
 ```
 
 **Addresses** (when a `make` target exists, it wraps the command):
@@ -52,6 +52,7 @@ Companion documents:
 | Spark UI (Structured Streaming tab) | http://localhost:4040 |
 | Airflow (no login) | http://localhost:8080 |
 | dbt docs, lineage graph (after `make dbt-docs`) | http://localhost:8082 |
+| Dashboard on the serving copy (after `make dashboard`) | http://localhost:8501 |
 
 ---
 
@@ -317,6 +318,44 @@ Run on the live file, `dbt docs generate` would hold DuckDB's single lock for se
 - **Readers never take the writer's lock.** Data comes from an atomic serving copy, and the docs from a copy of the structure.
 - **One dbt project, two runners, separate artifacts.** Airflow's dbt writes `transform/target/` (its `quality_report` reads `run_results.json` from there). dbt on the host writes `target-host/` or `target-docs/`.
 
+### Stop 6: the dashboard, a reader of the serving copy
+
+**Open:** http://localhost:8501 after `make dashboard` (Ctrl-C stops it). It runs on your host, listening on localhost only.
+
+```bash
+make dashboard       # Streamlit: dashboard/app.py
+make smoke           # then watch the page reload by itself once dbt republishes
+```
+
+The dashboard is the end of the pipeline: a consumer, like an analyst's notebook would be. It reads `data/warehouse/bikeshare_serving.duckdb` and nothing else. It never opens the warehouse, so it can't queue behind a landing or make one wait. Four tabs, each ending with a *table view* of its data:
+
+| Tab | Shows | From |
+|---|---|---|
+| **Detection** | recall per fault type for the bridge, Spark and dbt; for each check, the share of its detections that are true, explained by another fault, or unexplained | `mart_detection_scorecard` |
+| **Data quality** | events per simulated day; source duplicates, late events and dead letters per day (the late-event spikes are stream stalls) | `mart_data_quality_daily` |
+| **City** | trips per hour of day, members vs casual riders (the commute peaks); a station map sized by docks, colored by the share of time a station was empty or full | `fct_trips`, `mart_station_usage_hourly`, `dim_stations` |
+| **Pipeline** | rows landed and bridge→DuckDB latency per wall-clock hour (UTC); the days where Spark's windows and the batch record differ | `mart_pipeline_health`, `mart_stream_vs_batch` |
+
+One slider above the tabs picks the simulated days for *Data quality* and *City*. *Detection* and *Pipeline* have their own time rules (the judge horizon, wall-clock hours), so the slider doesn't apply to them.
+
+**How it stays current without a lock:**
+
+1. Airflow's `publish_serving` builds the new copy under a temporary name, then `os.replace`s it: readers see the old file or the new one, never half of each.
+2. The dashboard loads every query once per *version* of that file: `st.cache_data`, keyed on the file's modification time.
+3. A small `st.fragment(run_every="30s")` compares that time with the file on disk and reruns the page when a new copy has landed. A connection still open on the old file keeps reading the old version.
+
+**Read, in order:**
+
+1. `dashboard/app.py`: its docstring, then `load` and `follow_new_copies`, then one tab function
+2. `orchestration/include/serving/publish.py`: the other half of the handshake
+3. `dashboard/tests/test_app.py`: the page run headlessly (Streamlit's `AppTest`) on a serving copy built in the test
+
+**Ideas:**
+
+- **A dashboard is just another reader of the serving layer.** Nothing about it is special to the warehouse.
+- **Cache by data version, not by clock.** The file's mtime is the version, so a reload costs nothing until Airflow publishes.
+- **Honest charts.** Colors come from a palette validated for color-vision deficiencies, and bridge, spark and dbt keep the same color in every chart. Every chart has tooltips and a table view. Timestamps are shown in UTC, not in your browser's time zone. A series that is almost all zeros becomes a short table ("days that differ"), not a chart.
+
 ---
 
 ## 5. Experiments
@@ -412,7 +451,6 @@ COPY FROM DATABASE live TO mine;
 
 ## 8. What is not here (yet)
 
-- **A dashboard** on the serving copy, e.g. Streamlit (optional, layer 6).
 - **Natural extensions:**
   - Schema Registry (Avro or Protobuf) instead of JSON;
   - a Spark cluster or Spark Connect instead of `local[4]`;

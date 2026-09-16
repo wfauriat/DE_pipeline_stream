@@ -30,7 +30,7 @@ dependencies = []
 package = false
 # `uv sync` installs these groups. `spark` is ~400 MB but a core part of the
 # stack: the Spark rules are unit-tested locally (streaming/tests).
-default-groups = ["dev", "warehouse", "spark"]
+default-groups = ["dev", "warehouse", "spark", "dashboard"]
 
 [tool.uv.workspace]
 members = ["source", "ingest"]
@@ -66,9 +66,18 @@ warehouse = [
 spark = [
     "pyspark==4.2.0",
 ]
+# The Streamlit dashboard on the serving copy (dashboard/app.py, `make dashboard`).
+# It shares uv.lock with the services: adding it moved websockets (used only by
+# uvicorn[standard] in the source image, for WebSocket support the SSE API never uses).
+# pandas < 3: Streamlit brings pandas in, and pyspark 4.2 (the `spark` group, same
+# environment) warns that it does not fully support pandas 3.
+dashboard = [
+    "streamlit>=1.50",
+    "pandas>=2.2,<3",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["source/tests", "ingest/tests", "streaming/tests", "orchestration/tests"]
+testpaths = ["source/tests", "ingest/tests", "streaming/tests", "orchestration/tests", "dashboard/tests"]
 # importlib mode: both members can have tests/test_*.py with the same file
 # names without clashing. Shared test helpers are therefore plain modules with
 # unique names (source/tests/simkit.py, ingest/tests/bridgekit.py), put on the path here.

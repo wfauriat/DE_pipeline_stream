@@ -178,6 +178,7 @@ make serving        # what the serving copy holds, and when it was published
 make sql            # harlequin on the serving copy
 make dbt c="build -s staging"   # dbt on the host (same version; mind the warehouse lock)
 make dbt-docs       # lineage graph raw → marts: http://localhost:8082 (built from a structure-only copy)
+make dashboard      # Streamlit on the serving copy: http://localhost:8501 (TOUR.md, stop 6)
 ```
 
 What dbt shows here, beyond models:
