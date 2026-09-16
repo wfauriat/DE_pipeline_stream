@@ -12,8 +12,8 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 1a | Environment: uv workspace, `.env.example`, Makefile skeleton | ✅ done | 2026-09-15 | `9c0606a` |
 | 1b | Source: sim clock, world, engine, faults, FastAPI and SSE, tests, Dockerfile, compose | ✅ done | 2026-09-15 | `efee5aa` |
 | 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ✅ done | 2026-09-15 | `04dede1` |
-| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done | 2026-09-16 | `87929c4` |
-| 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ⏸ waiting for your review | 2026-09-16 | "Layer 4" commit |
+| 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
+| 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
 | 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⬜ todo | | |
 | 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⬜ todo | | |
 
@@ -25,6 +25,36 @@ Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
 2. Check the repo state with `git log --oneline` and `git status`.
 3. Pick up the first row above that is not ✅. Stop for review at the end of each layer.
 4. Constraint: the sibling `../refund-lab-*` repos are a separate hands-on exercise. Never read, modify or reuse them.
+
+## Deferred reviews: replaying a layer from its commit
+
+On 2026-09-16 you accepted layers 3 and 4 without their review stops, planning
+to replay them later from their commits. Each commit holds one complete,
+runnable layer:
+
+| Layer | Commit | Section in this file |
+|---|---|---|
+| 3: Spark analyzer | `87929c4` | "Layer 3: Spark analyzer" |
+| 4: Airflow and the landing zone | `dbfff54` | "Layer 4: Airflow and the DuckDB landing zone" |
+
+To replay one:
+
+```bash
+make down                        # stop the current stack (every profile)
+git switch --detach 87929c4      # the layer's commit (dbfff54 for layer 4)
+make reset                       # optional: start from an empty world, topics, lake and warehouse
+make setup && make up            # sync .venv to that commit's uv.lock, then build and start
+# … explore with that layer's "How to poke at it" list …
+make down && git switch main     # back to the latest layer
+make setup && make up            # re-sync .venv and restart
+```
+
+Things to know:
+
+- **Commit or stash first.** `git switch` refuses to leave uncommitted changes behind.
+- **Layer 3's commit has no Airflow services.** Its Makefile defaults to `COMPOSE_PROFILES=stream`, but your current `.env` says `stream,batch`. Compose simply finds nothing in the `batch` profile.
+- **Your data survives a replay unless you run `make reset`.** Newer data under `data/` (e.g. the DuckDB warehouse) is simply unused by layer 3.
+- **Replaying layer 3 on the existing data** means Spark resumes from its checkpoints. For a clean replay, run `make spark-reset` before `make up`.
 
 ## Built so far
 
