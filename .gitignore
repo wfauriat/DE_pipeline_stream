@@ -17,6 +17,7 @@ __pycache__/
 transform/target/
 transform/logs/
 transform/dbt_packages/
+transform/.user.yml
 
 # Airflow task logs, if written to the host
 orchestration/logs/

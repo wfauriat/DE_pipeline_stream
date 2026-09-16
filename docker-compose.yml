@@ -65,9 +65,16 @@ x-airflow-common: &airflow-common
     AIRFLOW_CONN_KAFKA_LANDING: '{"conn_type": "generic", "extra": {"bootstrap.servers": "kafka:9092"}}'
     AIRFLOW_CONN_BIKESHARE_API: '{"conn_type": "http", "schema": "http", "host": "source-api", "port": 8000}'
     AIRFLOW_VAR_WAREHOUSE_PATH: /data/warehouse/bikeshare.duckdb
+    AIRFLOW_VAR_SERVING_PATH: /data/warehouse/bikeshare_serving.duckdb   # readers use this copy (layer 5)
+    # ── dbt (layer 5), run by DAG dbt_transform from /opt/dbt-venv ──
+    DBT_PROFILES_DIR: /opt/airflow/transform              # → transform/profiles.yml
+    DUCKDB_PATH: /data/warehouse/bikeshare.duckdb         # read by profiles.yml (same file as the variable above)
+    LAKE_DIR: /data/lake                                  # read by models/sources.yml (Spark's Parquet)
+    DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
   volumes:
     - ./orchestration/dags:/opt/airflow/dags          # DAG files: edit on the host, no rebuild
-    - ./orchestration/include:/opt/airflow/include    # the `landing` package
+    - ./orchestration/include:/opt/airflow/include    # the `landing` and `serving` packages
+    - ./transform:/opt/airflow/transform              # the dbt project (dbt writes target/ and logs/ here)
     - airflow-logs:/opt/airflow/logs                  # task logs, shared by scheduler and API server
     - ./data/warehouse:/data/warehouse                # the DuckDB file (written by the DAGs)
     - ./data/lake:/data/lake:ro                       # Spark's Parquet output (read by dbt, layer 5)

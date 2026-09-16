@@ -43,7 +43,7 @@ JSON     := -H 'content-type: application/json'
         source-run source-reset clock speed pause resume ff stream stats \
         faults fault fault-rate fault-on fault-off fault-log \
         topics tail dlq bridge-run bridge-reset alerts lake spark-reset \
-        dags runs trigger warehouse sql
+        dags runs trigger warehouse sql dbt dbt-docs scorecard quality serving
 
 help: ## list targets
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -216,7 +216,30 @@ trigger: ## run a DAG now, outside its schedule: make trigger d=api_extract
 warehouse: ## what landed in DuckDB: rows per raw table, loader positions vs Kafka, last batches
 	@PYTHONPATH=orchestration/include $(UV) run python scripts/peek_warehouse.py
 
-# harlequin gets a read-only connection, but DuckDB still refuses it while a DAG
-# task holds the write lock. If it does, try again a few seconds later.
-sql: ## explore the warehouse in harlequin (a terminal SQL IDE), read-only
-	$(UV) run harlequin --read-only data/warehouse/bikeshare.duckdb
+# harlequin on the SERVING copy (layer 5): the marts, never locked by a DAG.
+# For raw/staging, point it at data/warehouse/bikeshare.duckdb instead, which
+# DuckDB refuses while a task writes (retry).
+sql: ## explore the marts in harlequin (a terminal SQL IDE), on the serving copy
+	$(UV) run harlequin --read-only data/warehouse/bikeshare_serving.duckdb
+
+##@ dbt and the serving copy
+# dbt on the host, from transform/: the same dbt version as in Airflow, and the
+# same live warehouse. It needs the write lock, so it fails if a DAG task is
+# writing at that moment. Run it again, or pause the DAGs in the UI while you iterate.
+DBT := DBT_PROFILES_DIR=. DBT_SEND_ANONYMOUS_USAGE_STATS=false $(UV) run dbt
+
+dbt: ## run dbt on the host: make dbt c="build -s staging"  (default: build)
+	cd transform && $(DBT) $(or $(c),build)
+
+dbt-docs: ## dbt docs with the lineage graph, raw → marts: http://localhost:8082
+	cd transform && $(DBT) docs generate && $(DBT) docs serve --port 8082 --no-browser
+
+# These read the serving copy, which Airflow republishes after every dbt build.
+scorecard: ## precision and recall of every detector, against the ground truth
+	@$(UV) run python scripts/peek_serving.py scorecard
+
+quality: ## data quality per simulated day
+	@$(UV) run python scripts/peek_serving.py quality
+
+serving: ## what the serving copy holds, and when it was published
+	@$(UV) run python scripts/peek_serving.py published

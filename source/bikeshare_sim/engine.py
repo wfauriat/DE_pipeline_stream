@@ -188,10 +188,19 @@ class Engine:
 
     # ── station snapshots ───────────────────────────────────────────────────
     def _status_snapshots(self, t1: datetime) -> list[dict]:
+        """Snapshots due in this step, stamped with the step's END.
+
+        The values are read after the whole step's trips are applied, so they are
+        the station's state at t1. Stamping a snapshot with its scheduled time
+        inside the step would report trips from its own future: a snapshot at
+        08:00:03 would already count a bike taken at 08:00:07. A consumer
+        checking "snapshot N vs snapshot N-1 vs the trips in between" (dbt's
+        int_status_sequence) would then be misled.
+        """
         events = []
         for i in range(len(self.world.stations)):
             while self._next_status[i] < t1:
-                events.append(self._event("station_status", self._next_status[i], self._status(i)))
+                events.append(self._event("station_status", t1, self._status(i)))
                 self._next_status[i] += self._status_every
         return events
 

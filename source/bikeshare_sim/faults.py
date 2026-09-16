@@ -147,7 +147,9 @@ class FaultLayer:
         out.extend(self._release_delayed(t1))
 
         if self._active("stream_stall"):
-            self._stall_buffer.extend(out)  # nothing leaves the vendor during a stall
+            # Nothing leaves the vendor during a stall. If a stall ended and a new
+            # one started in this very step, the backlog just flushed goes back in.
+            self._stall_buffer.extend(flushed + out)
             return []
         return flushed + out
 

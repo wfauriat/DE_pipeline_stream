@@ -69,3 +69,13 @@ def test_status_snapshots_every_interval(settings):
         e["payload"]["station_id"] for e in emitted(sim) if e["event_type"] == "station_status"
     )
     assert set(per_station.values()) == {60 // 5}
+
+
+def test_status_snapshots_are_stamped_when_their_values_are_true(settings):
+    """A snapshot's values include every trip up to its timestamp, and none after it."""
+    sim = make_sim(settings)
+    run_for(sim, hours=3)
+    step = settings.clock.step_seconds
+    for e in emitted(sim):
+        if e["event_type"] == "station_status":
+            assert datetime.fromisoformat(e["event_time"]).timestamp() % step == 0

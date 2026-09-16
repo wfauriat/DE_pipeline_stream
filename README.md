@@ -142,3 +142,57 @@ Wiring worth reading:
 
 The landing code is plain Python (`orchestration/include/landing/`), unit-tested
 without Airflow; the DAGs only schedule it.
+
+## Layer 5: dbt, the scorecard and the serving copy
+
+dbt (`transform/`) turns `raw` into analytics tables inside the same DuckDB warehouse:
+
+```
+raw.* (Airflow) ─┐                         ┌─ dim_stations, fct_trips (incremental)
+                 ├─► staging ─► intermediate ─┼─ mart_station_usage_hourly
+lake (Spark) ────┘   9 views    trips, status ├─ mart_data_quality_daily
+                                sequences,    ├─ mart_detection_scorecard   (vs the ground truth)
+snap_stations (SCD2) ──────────  detections    ├─ mart_pipeline_health
+seed detection_checks ─────────────────────────└─ mart_stream_vs_batch      (Spark vs batch)
+```
+
+The DAG `dbt_transform` has **no schedule**. It runs when `stream_landing` or
+`api_extract` emits its asset, i.e. when new rows have landed:
+
+1. `dbt source freshness`
+2. `dbt build`: seeds, snapshot, models and tests, in order
+3. a quality report in the task log
+4. **publish**: the marts are copied into `data/warehouse/bikeshare_serving.duckdb`,
+   swapped atomically. Readers query that copy, so the warehouse's single-writer
+   lock never blocks them.
+
+```bash
+make scorecard      # precision/recall of the bridge, Spark and dbt checks vs the fault log
+make quality        # data quality per simulated day
+make serving        # what the serving copy holds, and when it was published
+make sql            # harlequin on the serving copy
+make dbt c="build -s staging"   # dbt on the host (same version; mind the warehouse lock)
+make dbt-docs       # lineage graph raw → marts: http://localhost:8082
+```
+
+What dbt shows here, beyond models:
+
+- **Snapshot (SCD2):** `snap_stations` keeps the history of station capacities, so
+  "more bikes than docks" is judged against the capacity valid at the time.
+- **Incremental model:** `fct_trips` only reprocesses trips whose latest half
+  *landed* since the last run, so late events are still counted.
+- **Seed:** `detection_checks.csv` maps each check to the fault it targets.
+- **Tests:**
+  - generic tests, plus a custom `within_range`;
+  - two singular tests that are *expected* to find rows (severity `warn`, rows
+    kept in schema `audit`);
+  - a unit test of trip pairing;
+  - an enforced contract on the scorecard.
+- **Macros:** `haversine_km`, an empty-lake guard, and the schema naming rule.
+
+The scorecard answers "who catches what". The bridge's contract check catches
+negative bike counts; Spark and dbt catch over-capacity reports; together they
+catch every impossible status. dbt's snapshot-by-snapshot check finds every frozen
+station that Spark's 2-hour windows miss. Detections caused by a *different*
+fault (an orphan trip whose other half was dead-lettered) are counted as
+"explained", not as plain false positives.

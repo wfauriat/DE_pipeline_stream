@@ -56,7 +56,8 @@ dev = [
 warehouse = [
     "duckdb==1.5.5",
     "pyarrow>=25",
-    "dbt-duckdb>=1.10",
+    "dbt-core==1.12.5",  # = the Airflow image (orchestration/Dockerfile)
+    "dbt-duckdb==1.11.0",
     "harlequin>=2",
 ]
 # Local pyspark to unit-test the streaming rules without the Spark container.
@@ -87,7 +88,7 @@ target-version = "py312"
 
 [tool.ruff.lint.isort]
 # Import blocks: stdlib / third-party / our packages / test helpers.
-known-first-party = ["bikeshare_sim", "bikeshare_bridge", "analyzer", "landing"]
+known-first-party = ["bikeshare_sim", "bikeshare_bridge", "analyzer", "landing", "serving"]
 known-local-folder = ["simkit", "bridgekit"]
 
 # For editors (Pyright / Pylance): analyse with the project's .venv, where the

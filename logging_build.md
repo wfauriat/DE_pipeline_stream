@@ -14,7 +14,7 @@ The plan of record is in [`PLAN.md`](PLAN.md). This file tracks progress against
 | 2 | Kafka (KRaft), topic init, bridge (SSE → Kafka, DLQ), Redpanda Console | ✅ done | 2026-09-15 | `04dede1` |
 | 3 | Spark Structured Streaming analyzer: alerts topic, Parquet metrics | ✅ done (review deferred) | 2026-09-16 | `87929c4` |
 | 4 | Airflow 3 (LocalExecutor): DuckDB landing and API extract DAGs, pool, assets | ✅ done (review deferred) | 2026-09-16 | `dbfff54` |
-| 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⬜ todo | | |
+| 5 | dbt-duckdb project, `dbt_transform` DAG, serving copy, DQ scorecard | ⏸ waiting for your review | 2026-09-16 | "Layer 5" commit |
 | 6 | README guided tour, wiring map, smoke script, optional Streamlit | ⬜ todo | | |
 
 Legend: ⬜ todo · ⏳ in progress · ⏸ waiting for your review · ✅ done
@@ -271,6 +271,62 @@ Things to know:
 - **Crash tests:** `SIGKILL` of the scheduler while a `land_*` task was running, 3 times. The killed attempt left nothing (its transaction never committed), the retry landed the slice once, and the invariant held each time. Recovery took 5 min 01 s and 5 min 24 s with the defaults, then 87 s after setting `orphaned_tasks_check_interval=60` (see decisions).
 - **Resources:** Airflow ~1.1 GB (scheduler 570 MB, API server 270 MB, DAG processor 190 MB, Postgres 45 MB). The whole stack ~3.8 GB.
 
+### Layer 5: dbt, the scorecard and the serving copy (2026-09-16)
+
+**Read first, in this order:**
+
+1. `transform/dbt_project.yml` and `profiles.yml`: layers, schemas, shared thresholds, the connection.
+2. `models/sources.yml`: raw plus the Spark lake as an external source.
+3. `models/intermediate/int_status_sequence.sql` and `int_detections.sql`: the exact sequential checks, and every detector in one shape.
+4. `models/marts/mart_detection_scorecard.sql`.
+5. `orchestration/dags/dbt_transform.py`: asset scheduling, then build → report → publish.
+6. `orchestration/include/serving/publish.py`: the atomic serving copy.
+
+| Path | Purpose |
+|---|---|
+| `transform/dbt_project.yml` | One schema per layer (staging and intermediate are views, marts are tables), plus snapshots and reference. Vars shared with other components: status interval, late threshold, teleport speed, max trip hours, judge horizon. |
+| `transform/profiles.yml` | dbt-duckdb, path from `DUCKDB_PATH` (the default works from `transform/`), `TimeZone: UTC`. |
+| `transform/models/sources.yml` | `raw.*` with freshness on `loaded_at`, and `lake.station_metrics` via `external_location` (read_parquet, from `LAKE_DIR`). |
+| `models/staging/` (9 views) | JSON → typed columns. Dedup by `event_id` with `copies` and `source_copies` (source duplicate vs bridge re-send), `lateness_min`. Dead letters re-parsed from `raw`. Alerts deduped by `alert_id`. Fault log keys and variants. `stg_station_metrics` guards against an empty lake. |
+| `snapshots/snap_stations.yml` | SCD2 on `updated_at` (timestamp strategy); current version valid to 9999-12-31. |
+| `seeds/detection_checks.csv` | Check → targeted fault → how to match (event, trip, episode, stall). |
+| `models/intermediate/` | `int_trips` (full outer join, pairing with a latest-event horizon, haversine speed); `int_status_sequence` (a table: LAG, trips between snapshots via a range join, `stale_snapshot`, `reporting_gap`, `trip_event_ids`); `int_detections` (bridge + Spark + 7 dbt checks). |
+| `models/marts/` (7 tables) | `dim_stations` (current SCD2 version), `fct_trips` (incremental on `loaded_at`, delete+insert), `mart_station_usage_hourly` (with weather), `mart_data_quality_daily`, `mart_detection_scorecard` (enforced contract), `mart_pipeline_health` (batches, Kafka→DuckDB latency), `mart_stream_vs_batch` (Spark windows vs batch, final on both sides). |
+| `tests/` | Generic `within_range`; singular `status_above_capacity` and `trip_speed_implausible` (warn + store_failures → schema `audit`). |
+| `macros/` | `generate_schema_name` (plain schema names), `haversine_km`, `lake_file_count` (empty-lake guard), `duckdb__snapshot_get_time` (TIMESTAMPTZ clock). |
+| `*.yml` model files | Docs, unique/not_null/accepted_values/relationships tests, unit test `int_trips_pairs_halves_and_spots_orphans`, contract on the scorecard. |
+| `orchestration/dags/dbt_transform.py` | `schedule=(raw_stream \| raw_api)`: `source_freshness` → `dbt_build` (all_done) → `quality_report` (all_done; logs results, freshness and the scorecard) → `publish_serving` (only after a successful build; Asset `serving_marts`). All tasks in pool `duckdb`. |
+| `orchestration/include/serving/publish.py` | Copies every `marts` table plus a `published` row into `bikeshare_serving.duckdb.tmp`, then `os.replace`. 2 tests: only marts are published; an open reader keeps its snapshot while a new process sees the new file. |
+| `docker-compose.yml` | Adds `DBT_PROFILES_DIR`, `DUCKDB_PATH`, `LAKE_DIR`, `DBT_SEND_ANONYMOUS_USAGE_STATS`, `AIRFLOW_VAR_SERVING_PATH` and the `./transform` mount. |
+| `Makefile` | `dbt c=…` (host), `dbt-docs` (:8082), `scorecard`, `quality`, `serving`. `sql` now opens the serving copy. |
+| `scripts/peek_serving.py` | Reads the serving copy (never locked). |
+| `source/…/engine.py` | **Fix:** status snapshots are stamped with their step's end, the instant their values are true. |
+| `source/…/faults.py` | **Fix:** back-to-back stalls no longer drop the first stall's backlog. |
+| `source/tests/` | +2 tests. The stall test was checked to FAIL on the old code. |
+
+**How to poke at it:**
+
+- `make scorecard`, `make quality` and `make serving`
+- `make sql`, then e.g. `FROM marts.mart_stream_vs_batch`
+- `make dbt-docs` for the lineage graph
+- http://localhost:8080 → DAG `dbt_transform`, and the Assets view (`raw_stream` → `dbt_transform` → `serving_marts`)
+
+**Verified:**
+
+- Developed against a **copy** of the live warehouse (`ATTACH … READ_ONLY` + `COPY FROM DATABASE`), so the running Airflow never saw a lock.
+- Full build on ~210k events: 63 pass, 2 expected warns (205 over-capacity, 88 teleports), 0 errors, in 18 s.
+- **End to end from `make reset`:**
+  - 11 services up;
+  - 3 DAGs parsed;
+  - `dbt_transform` ran `asset_triggered` after each landing and succeeded (freshness 2 s, build 4–14 s, report, publish);
+  - the serving copy was published with 7 marts.
+- A manual `api_extract` → asset event → dbt run → republished serving copy → `make scorecard`.
+- **Scorecard on the fresh world** (~5 simulated days at 600×):
+  - precision ~100% for duplicate, contract, over_capacity, late_event and teleport;
+  - recall: impossible_status 100% combined (bridge 37.5% + Spark/dbt 62.5%), schema drift, late, stall, silent and teleport all 100%, orphans 97.6%, duplicates 99.6%;
+  - frozen: dbt `stale_snapshot` 100% recall at 42% precision, 71% counting the teleport-explained ones; Spark 0/3 (short episodes).
+- Resources: stack ~4.5 GB RAM; disk 6.3 GB free.
+
 ## Decisions and deviations from the plan
 
 | Date | Decision | Why |
@@ -309,6 +365,17 @@ Things to know:
 | 2026-09-16 | No triggerer service. The official compose has one. | No deferrable operators here. Saves ~200 MB. |
 | 2026-09-16 | `orphaned_tasks_check_interval=60` and `task_instance_heartbeat_timeout=90` (defaults 300 / 300). | Measured: after a scheduler crash, the dead task held the only `duckdb` pool slot for 5 min. The first fix tried (heartbeat timeout alone) did not help, because the orphan check is what recovers a dead scheduler's tasks. Recovery is now 87 s. |
 | 2026-09-16 | Your `.env` was regenerated from `.env.example`. | It was identical to the layer 3 template, and `COMPOSE_PROFILES=stream` kept Airflow from starting. |
+| 2026-09-16 | **Source fix: status snapshots are stamped at their step's END.** The plan did not anticipate this. | The values were read at the end of the 10 s step but stamped at the scheduled time inside it, so a snapshot counted trips from its own future. dbt's exact frozen check had 13.7% precision; the cause was proven by realigning to step ends (1,002 → 238 detections). "Make the source truthful" beats encoding simulator internals in dbt. |
+| 2026-09-16 | **Source fix: back-to-back stalls.** | If a stall ended and another started in the same step, the flushed backlog was dropped (data loss). Found while reading the code during the late-event analysis. |
+| 2026-09-16 | The scorecard judges only up to `least(latest event − judge_after_hours, latest extracted fault)`, for precision and recall alike. | The fault log is extracted every 15 min (15 simulated hours at 60×), so it lags the events. Without the bound, late_event looked 82% precise; with it, 100%. |
+| 2026-09-16 | "Explained" false positives: orphans whose other half was dead-lettered (schema drift), and stale snapshots that counted a teleported arrival. | Reported next to precision, not hidden: one fault showing up as another is itself a finding. |
+| 2026-09-16 | A seed (`detection_checks.csv`) drives the scorecard's matching. | Adding a detector means adding rows, not rewriting SQL. |
+| 2026-09-16 | dbt reads Spark's Parquet in place as a source (`external_location`), with a glob guard. | Shows DuckDB and Spark sharing a lake; the build survives an empty lake (no `stream` profile, or before the first window closes). |
+| 2026-09-16 | `mart_stream_vs_batch` compares only windows final on BOTH sides. | Spark runs ahead of the 5-min landing: comparing Spark's newest windows produced −3,183 "missing" events. |
+| 2026-09-16 | Serving copy = marts only, rebuilt and `os.replace`d after each successful build. The plan said the whole DB. | Smaller, never locked, and it holds only what readers should use. |
+| 2026-09-16 | `duckdb__snapshot_get_time` overridden to TIMESTAMPTZ. | dbt-duckdb's naive TIMESTAMP clock warned against the TIMESTAMPTZ `updated_at`. |
+| 2026-09-16 | dbt pinned to the Airflow image's versions (`dbt-core==1.12.5`, `dbt-duckdb==1.11.0`) in the `warehouse` group. | The same dbt on the host and in Airflow, over the same file. |
+| 2026-09-16 | The end-to-end check ran after `make reset`. | The source fix only applies to new data, and it proves the whole pipeline starts from zero. |
 
 ## Pinned versions
 
@@ -330,6 +397,7 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 | Airflow extras | confluent-kafka 2.15.1, duckdb 1.5.5; `/opt/dbt-venv`: dbt-core 1.12.5, dbt-duckdb 1.11.0 | `orchestration/Dockerfile` |
 | Airflow metadata DB | `postgres:16-alpine` | `docker-compose.yml` |
 | duckdb (host) | 1.5.5, now pinned `==` (was `>=1.4`); pyarrow ≥ 25 added to `warehouse` | `pyproject.toml` |
+| dbt (host) | dbt-core 1.12.5, dbt-duckdb 1.11.0 (= the Airflow image) | `pyproject.toml` |
 | pytest / ruff | 9.1.1 / 0.16.7 | `uv.lock` |
 | Base image (source, bridge) | `python:3.12-slim` + `ghcr.io/astral-sh/uv:0.12.9` | `source/Dockerfile`, `ingest/Dockerfile` |
 | Kafka | `apache/kafka:4.3.1` (KRaft, JDK 21), cluster id `MoQ1R7PRSkaSfyAV5NC-sg` | `docker-compose.yml` |
@@ -364,10 +432,14 @@ Resolved in `uv.lock` on 2026-09-15. Image tags are added when their layer lands
 - **The warehouse file is `ai-user:root`** (Airflow runs as your UID with group 0, the official pattern). You own it and can delete it.
 - **Airflow CLI calls take a few seconds each** (`make dags`, `runs`, `trigger`): each one starts a Python process through the entrypoint. For tight polling, use the REST API (`curl localhost:8080/api/v2/...`), which needs no login locally.
 - **`stream_landing` lands at most 200k messages per partition per run** (`max_per_partition`) and reads for at most 120 s. After a huge fast-forward, it catches up over several runs (the notes in `raw._ingest_batches.detail` say so).
-- **Next (layer 5):**
-  - dbt project `transform/` (dbt-duckdb, profile path from env), with sources `raw.*` (freshness on `loaded_at`) and `lake.station_metrics` (Parquet);
-  - staging (typed JSON extraction, dedup on event_id), snapshot `snap_stations` (SCD2);
-  - intermediate: trips pairing, status gaps, flatlines (the exact frozen check);
-  - marts: `fct_trips`, `mart_station_usage_hourly`, `mart_data_quality_daily`, `mart_detection_scorecard` (Spark alerts + dbt checks vs ground truth, with secondary-effect attribution), `mart_pipeline_health`;
-  - tests (generic, singular, unit, one contract);
-  - DAG `dbt_transform` on the `raw_stream` / `raw_api` assets, then `publish_serving_copy`.
+- **dbt on the host (`make dbt`) needs the warehouse write lock.** It fails if a DAG task writes at that moment. Retry, or pause the DAGs while you iterate. For free exploration, copy the warehouse as in layer 5's development (`ATTACH … (READ_ONLY)` + `COPY FROM DATABASE`).
+- **At high simulation speed, the fault log lags** (extracted every 15 real minutes = 6 simulated days at 600×), so the scorecard judges an older horizon. `make trigger d=api_extract` refreshes it, and the asset event then rebuilds the marts.
+- **`stale_snapshot` still has unexplained false positives** (~29% of detections in the fresh run). Likely causes: dead-lettered or dropped trip events at the station, and silent rebalancing coinciding with trips. Candidate attributions to add.
+- **Spark's `frozen_station` found 0 of 3 frozen episodes in the fresh run** (short episodes). dbt's exact check found 3 of 3. That contrast is the point of having both.
+- **dbt rebuilds everything except `fct_trips` on each run** (views and tables). About 4–15 s at this volume. Incremental marts would be the next step at scale.
+- **Next (layer 6):**
+  - README guided tour (a start-to-finish walkthrough, what to open where);
+  - wiring map: every service ↔ host:port ↔ env var ↔ file;
+  - the "three clocks" explained once;
+  - `scripts/smoke.py` (`make smoke`): an end-to-end check from an empty stack (source healthy → topics filling → Spark alerts → landing → dbt → serving copy → scorecard rows);
+  - optional Streamlit dashboard on the serving copy.

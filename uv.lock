@@ -353,6 +353,7 @@ spark = [
     { name = "pyspark" },
 ]
 warehouse = [
+    { name = "dbt-core" },
     { name = "dbt-duckdb" },
     { name = "duckdb" },
     { name = "harlequin" },
@@ -370,7 +371,8 @@ dev = [
 ]
 spark = [{ name = "pyspark", specifier = "==4.2.0" }]
 warehouse = [
-    { name = "dbt-duckdb", specifier = ">=1.10" },
+    { name = "dbt-core", specifier = "==1.12.5" },
+    { name = "dbt-duckdb", specifier = "==1.11.0" },
     { name = "duckdb", specifier = "==1.5.5" },
     { name = "harlequin", specifier = ">=2" },
     { name = "pyarrow", specifier = ">=25" },

@@ -158,3 +158,17 @@ def test_stream_stall_holds_everything_then_flushes(settings):
     ends_at = fault["details"]["ends_at"]
     backlog = [e for e in emitted(sim) if fault["injected_at"] <= ts(e["event_time"]) < ends_at]
     assert backlog and all(ts(e["emitted_at"]) >= ends_at for e in backlog)
+
+
+def test_back_to_back_stalls_lose_nothing(tmp_path):
+    clean = make_sim(make_settings(tmp_path))
+    stalled = make_sim(make_settings(tmp_path))
+    stalled.faults.trigger("stream_stall")
+    run_for(stalled, minutes=5)
+    # The running stall ends at the next step, and a new one is armed for that same step.
+    [episode] = stalled.faults._episodes
+    episode.ends_at = stalled.engine.cursor
+    stalled.faults.trigger("stream_stall")
+    run_for(stalled, hours=3)  # both stalls are long over
+    run_for(clean, hours=3, minutes=5)
+    assert len(emitted(stalled)) == len(emitted(clean))  # same world, nothing lost on the way
